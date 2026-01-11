@@ -9,11 +9,12 @@ class GridConfig:
     
     def __init__(self):
         # ===================== 基础交易配置 =====================
-        self.symbol: str = ""
+        self.symbol: str = "BTCUSDC"
         self.timeframe_minutes: int = 3
         self.initial_capital: float = 10000
         self.leverage: int = 10
         self.margin_mode: str = "CROSSED"
+        self.grid_step_ratio: float = 0.001
         
         # ===================== 功能开关配置 =====================
         self.enable_wechat_push: bool = True
