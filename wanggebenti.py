@@ -50,9 +50,20 @@ class GridEngine:
             raise RuntimeError(f"获取价格失败: {result}")
         return float(result["data"]["price"])
 
+    def _get_open_step_ratio(self, side: str) -> float:
+        if side == "BUY":
+            return self.config.long_open_short_tp_step_ratio
+        return self.config.short_open_long_tp_step_ratio
+
+    def _get_take_profit_step_ratio(self, entry_side: str) -> float:
+        if entry_side == "BUY":
+            return self.config.short_open_long_tp_step_ratio
+        return self.config.long_open_short_tp_step_ratio
+
     def _calc_grid_prices(self, center_price: float) -> Dict[str, float]:
-        step = center_price * self.config.grid_step_ratio
-        return {"buy": center_price - step, "sell": center_price + step}
+        buy_step = center_price * self._get_open_step_ratio("BUY")
+        sell_step = center_price * self._get_open_step_ratio("SELL")
+        return {"buy": center_price - buy_step, "sell": center_price + sell_step}
 
     def _place_opening_orders(self, center_price: float) -> None:
         prices = self._calc_grid_prices(center_price)
@@ -81,7 +92,7 @@ class GridEngine:
         self.state.last_center_price = center_price
 
     def _place_take_profit(self, side: str, entry_price: float) -> None:
-        step = entry_price * self.config.grid_step_ratio
+        step = entry_price * self._get_take_profit_step_ratio(side)
         if side == "BUY":
             tp_price = entry_price + step
             tp_side = "SELL"
