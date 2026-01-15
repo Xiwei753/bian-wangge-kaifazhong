@@ -433,10 +433,34 @@ def subscribe_depth_ws(
     on_error: Optional[Callable[[websocket.WebSocketApp, Exception], None]] = None,
     on_close: Optional[Callable[[websocket.WebSocketApp, int, str], None]] = None,
     on_open: Optional[Callable[[websocket.WebSocketApp], None]] = None,
-) -> websocket.WebSocketApp:
+    ) -> websocket.WebSocketApp:
     """订阅指定交易对的盘口深度数据，返回 WebSocketApp 实例。"""
     stream = build_depth_stream_name(symbol, depth_level=depth_level, speed_ms=speed_ms)
     ws_url = f"{get_ws_base_url(use_testnet=use_testnet)}/{stream}"
+    return websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+
+
+def build_user_data_stream_url(listen_key: str, use_testnet: bool = False) -> str:
+    """构建用户数据流 WebSocket URL。"""
+    return f"{get_ws_base_url(use_testnet=use_testnet)}/{listen_key}"
+
+
+def subscribe_user_data_ws(
+    listen_key: str,
+    on_message: Callable[[websocket.WebSocketApp, str], None],
+    use_testnet: bool = False,
+    on_error: Optional[Callable[[websocket.WebSocketApp, Exception], None]] = None,
+    on_close: Optional[Callable[[websocket.WebSocketApp, int, str], None]] = None,
+    on_open: Optional[Callable[[websocket.WebSocketApp], None]] = None,
+) -> websocket.WebSocketApp:
+    """订阅用户数据流，返回 WebSocketApp 实例。"""
+    ws_url = build_user_data_stream_url(listen_key, use_testnet=use_testnet)
     return websocket.WebSocketApp(
         ws_url,
         on_message=on_message,
