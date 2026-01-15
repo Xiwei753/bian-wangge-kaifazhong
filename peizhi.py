@@ -133,12 +133,23 @@ class GridConfig:
         self.api_key: str = ""
         self.api_secret: str = ""
         self.use_testnet: bool = True
-        self.base_url: str = "https://testnet.binancefuture.com"
+        self.base_url_testnet: str = "https://testnet.binancefuture.com"
+        self.base_url_live: str = "https://fapi.binance.com"
         self.recv_window: int = 5000
         self.request_timeout: int = 10
         self.api_key_test: Optional[str] = None
         self.api_secret_test: Optional[str] = None
+        self.api_key_live: Optional[str] = None
+        self.api_secret_live: Optional[str] = None
 
     def get_um_base_url(self) -> str:
         """根据是否测试网返回 UM Futures base_url。"""
-        return "https://testnet.binancefuture.com" if self.use_testnet else "https://fapi.binance.com"
+        return self.base_url_testnet if self.use_testnet else self.base_url_live
+
+    def get_api_key(self) -> str:
+        """根据是否测试网返回对应 API Key。"""
+        return self.api_key_test if self.use_testnet else self.api_key_live
+
+    def get_api_secret(self) -> str:
+        """根据是否测试网返回对应 API Secret。"""
+        return self.api_secret_test if self.use_testnet else self.api_secret_live

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Dict, Optional
 import importlib.util
@@ -14,7 +15,7 @@ from peizhi import GridConfig
 
 
 def _load_sdk_module():
-    sdk_path = Path(__file__).with_name("binance sdk.py")
+    sdk_path = Path(__file__).with_name("binance_sdk.py")
     spec = importlib.util.spec_from_file_location("binance_sdk", sdk_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("无法加载 binance sdk.py 模块")
@@ -36,10 +37,11 @@ class GridOrderState:
 class GridEngine:
     def __init__(self, config: GridConfig):
         self.config = config
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.client = sdk.create_um_client(
-            api_key=config.api_key,
-            api_secret=config.api_secret,
-            base_url=config.base_url,
+            api_key=config.get_api_key(),
+            api_secret=config.get_api_secret(),
+            base_url=config.get_um_base_url(),
             timeout=config.request_timeout,
         )
         self.state = GridOrderState()
@@ -90,6 +92,14 @@ class GridEngine:
         self.state.buy_order_id = int(buy["data"]["orderId"])
         self.state.sell_order_id = int(sell["data"]["orderId"])
         self.state.last_center_price = center_price
+        self.logger.info(
+            "开仓挂单完成 center=%.4f buy_id=%s sell_id=%s buy_price=%.4f sell_price=%.4f",
+            center_price,
+            self.state.buy_order_id,
+            self.state.sell_order_id,
+            prices["buy"],
+            prices["sell"],
+        )
 
     def _place_take_profit(self, side: str, entry_price: float) -> None:
         step = entry_price * self._get_take_profit_step_ratio(side)
@@ -111,6 +121,13 @@ class GridEngine:
         )
         if not result["ok"]:
             raise RuntimeError(f"止盈单下单失败: {result}")
+        self.logger.info(
+            "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f order=%s",
+            side,
+            tp_side,
+            tp_price,
+            result["data"],
+        )
 
     def initialize(self) -> None:
         center_price = self._get_current_price()
@@ -119,9 +136,14 @@ class GridEngine:
     def _cancel_opposite(self, order_id: Optional[int]) -> None:
         if order_id is None:
             return
-        sdk.cancel_order(self.client, symbol=self.config.symbol, order_id=order_id)
+        result = sdk.cancel_order(self.client, symbol=self.config.symbol, order_id=order_id)
+        if not result["ok"]:
+            self.logger.warning("撤单失败 order_id=%s result=%s", order_id, result)
+            return
+        self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
 
     def _handle_filled_order(self, order_id: int, side: str, price: float) -> None:
+        self.logger.info("成交 order_id=%s side=%s price=%.4f", order_id, side, price)
         self._place_take_profit(side=side, entry_price=price)
         if side == "BUY":
             self._cancel_opposite(self.state.sell_order_id)
@@ -156,3 +178,22 @@ def run_grid_loop() -> None:
     while True:
         engine.sync_once()
         time.sleep(config.check_interval)
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
+
+if __name__ == "__main__":
+    try:
+        _setup_logging()
+        print("正在启动网格策略...")
+        run_grid_loop()
+    except KeyboardInterrupt:
+        print("程序已停止。")
+    except Exception as e:
+        logging.exception("网格策略运行失败")
+        print(f"发生错误: {e}")
