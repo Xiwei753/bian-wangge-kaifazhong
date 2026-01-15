@@ -1,7 +1,13 @@
 #所有可以改动的，可以开关的，比如交易对，网格参数，等等。用btcusdc合约，双向持仓，固定100倍杠杆。每个仓位用20u保证金。固定交易精度和下单精度为0.1（四舍五入。）
 #一个不正确但是大概没问题的例子，可能语法有问题，但是其他参数没有问题
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
+
+
+class MarketMode(str, Enum):
+    CONSOLIDATION = "consolidation"
+    TREND = "trend"
 
 @dataclass
 class GridConfig:
@@ -15,6 +21,9 @@ class GridConfig:
         self.leverage: int = 10
         self.margin_mode: str = "CROSSED"
         self.grid_step_ratio: float = 0.001
+        self.long_open_short_tp_step_ratio: float = 0.001
+        self.short_open_long_tp_step_ratio: float = 0.001
+        self.market_mode: MarketMode = MarketMode.CONSOLIDATION
         
         # ===================== 功能开关配置 =====================
         self.enable_wechat_push: bool = True
