@@ -89,7 +89,7 @@ class GridEngine:
         prices = self._calc_grid_prices(center_price)
         order_size = self._round_quantity(self.config.fixed_order_size)
         
-        # === 修复：添加 position_side 参数以支持双向持仓 ===
+        # === 双向持仓开单 ===
         buy = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
@@ -98,7 +98,7 @@ class GridEngine:
             quantity=order_size,
             price=self._round_price(prices["buy"]),
             time_in_force="GTC",
-            position_side="LONG"  # 开多单属于 LONG 方向
+            position_side="LONG"
         )
         
         sell = sdk.new_order(
@@ -109,7 +109,7 @@ class GridEngine:
             quantity=order_size,
             price=self._round_price(prices["sell"]),
             time_in_force="GTC",
-            position_side="SHORT" # 开空单属于 SHORT 方向
+            position_side="SHORT"
         )
         
         if not buy["ok"] or not sell["ok"]:
@@ -130,14 +130,12 @@ class GridEngine:
     def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> int:
         step = entry_price * self._get_take_profit_step_ratio(side)
         
-        # === 修复：根据持仓方向确定 position_side ===
+        # === 双向持仓止盈 ===
         if side == "BUY":
-            # 之前是开多(BUY)，现在要平多，操作是卖(SELL)，持仓方向是 LONG
             tp_price = entry_price + step
             tp_side = "SELL"
             pos_side = "LONG"
         else:
-            # 之前是开空(SELL)，现在要平空，操作是买(BUY)，持仓方向是 SHORT
             tp_price = entry_price - step
             tp_side = "BUY"
             pos_side = "SHORT"
@@ -153,8 +151,8 @@ class GridEngine:
             quantity=order_size,
             price=tp_price,
             time_in_force="GTC",
-            reduce_only=True, # 依然保持只减仓
-            position_side=pos_side # 必须指定方向
+            # reduce_only=True,  <--- 【关键修改】在双向持仓模式(Hedge Mode)下，必须删掉这行！
+            position_side=pos_side
         )
         
         if not result["ok"]:
@@ -172,14 +170,9 @@ class GridEngine:
 
     def initialize(self) -> None:
         self.logger.info("正在初始化策略...")
-        
-        # === 新增：确保账户处于双向持仓模式 ===
         try:
-            # 尝试设置为双向持仓 (True)
-            # 如果已经是双向持仓，API可能会报错 "No need to change position side."，这是正常的，可以忽略
             res = sdk.change_position_mode(self.client, dual_side=True)
             if not res['ok'] and res.get('status_code') != 400: 
-                # 400 通常意味着“不需要修改”，其他错误才打印警告
                 self.logger.warning(f"设置持仓模式警告: {res}")
         except Exception as e:
             self.logger.warning(f"设置持仓模式异常 (如果是 'No need to change' 可忽略): {e}")
@@ -226,7 +219,7 @@ class GridEngine:
             side=side, entry_price=price, quantity=quantity
         )
 
-    def _ensure_take_profit_orders(self, open_ids: set[int]) -> None:
+    def _ensure_take_profit_orders(self) -> None:
         for side in ("BUY", "SELL"):
             entry_price = self.state.last_entry_price.get(side)
             entry_qty = self.state.last_entry_quantity.get(side)
@@ -236,17 +229,24 @@ class GridEngine:
                 
             tp_order_id = self.state.tp_order_id.get(side)
             
-            if tp_order_id and tp_order_id in open_ids:
-                continue
-            
             if tp_order_id:
+                # 定向查询，避开 get_open_orders
                 tp_order = sdk.get_order(
                     self.client, symbol=self.config.symbol, order_id=tp_order_id
                 )
-                if tp_order["ok"] and tp_order["data"].get("status") == "FILLED":
-                    continue
-                self.state.tp_order_id[side] = None
-            
+                if tp_order["ok"]:
+                    status = tp_order["data"].get("status")
+                    if status in ["NEW", "PARTIALLY_FILLED"]:
+                        continue 
+                    if status == "FILLED":
+                        self.state.tp_order_id[side] = None
+                        continue
+                    self.state.tp_order_id[side] = None # 被撤单或其他异常，重置以补单
+                else:
+                    self.logger.warning(f"查询止盈单失败: {tp_order}")
+                    self.state.tp_order_id[side] = None
+
+            # 补挂止盈单
             self.logger.info(
                 "检测到止盈单缺失 entry_side=%s entry_price=%.4f qty=%.4f，重新下单",
                 side,
@@ -258,26 +258,27 @@ class GridEngine:
             )
 
     def sync_once(self) -> None:
-        open_orders = sdk.get_open_orders(self.client, symbol=self.config.symbol)
-        if not open_orders["ok"]:
-            raise RuntimeError(f"查询挂单失败: {open_orders}")
-        open_ids = {int(o["orderId"]) for o in open_orders["data"]}
-        for order_id, side in (
+        # 定向查询开仓单
+        target_orders = [
             (self.state.buy_order_id, "BUY"),
-            (self.state.sell_order_id, "SELL"),
-        ):
-            if order_id is None or order_id in open_ids:
+            (self.state.sell_order_id, "SELL")
+        ]
+        
+        for order_id, side in target_orders:
+            if order_id is None:
                 continue
+            
             order = sdk.get_order(self.client, symbol=self.config.symbol, order_id=order_id)
             if not order["ok"]:
-                raise RuntimeError(f"查询订单失败: {order}")
+                continue
+                
             status = order["data"].get("status")
             if status == "FILLED":
                 fill_price = float(order["data"].get("avgPrice") or order["data"].get("price"))
                 fill_qty = float(order["data"].get("executedQty") or 0)
                 self._handle_filled_order(order_id, side, fill_price, fill_qty)
         
-        self._ensure_take_profit_orders(open_ids)
+        self._ensure_take_profit_orders()
 
     def run_order_loop(self) -> None:
         while not self.stop_event.is_set():
