@@ -100,8 +100,8 @@ class GridEngine:
         self.state.sell_order_id = int(sell["data"]["orderId"])
         self.state.last_center_price = center_price
         self.logger.info(
-            "开仓挂单完成 center=%.4f buy_id=%s sell_id=%s buy_price=%.4f sell_price=%.4f",
-            center_price,
+            "开仓挂单完成 center=%.1f buy_id=%s sell_id=%s buy_price=%.1f sell_price=%.1f",
+            self._round_order_value(center_price),
             self.state.buy_order_id,
             self.state.sell_order_id,
             self._round_order_value(prices["buy"]),
@@ -131,7 +131,7 @@ class GridEngine:
         if not result["ok"]:
             raise RuntimeError(f"止盈单下单失败: {result}")
         self.logger.info(
-            "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f order=%s",
+            "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.1f order=%s",
             side,
             tp_side,
             tp_price,
@@ -152,7 +152,12 @@ class GridEngine:
         self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
 
     def _handle_filled_order(self, order_id: int, side: str, price: float) -> None:
-        self.logger.info("成交 order_id=%s side=%s price=%.4f", order_id, side, price)
+        self.logger.info(
+            "成交 order_id=%s side=%s price=%.1f",
+            order_id,
+            side,
+            self._round_order_value(price),
+        )
         self._place_take_profit(side=side, entry_price=price)
         if side == "BUY":
             self._cancel_opposite(self.state.sell_order_id)
