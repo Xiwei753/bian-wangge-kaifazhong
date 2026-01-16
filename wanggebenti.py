@@ -88,6 +88,8 @@ class GridEngine:
     def _place_opening_orders(self, center_price: float) -> None:
         prices = self._calc_grid_prices(center_price)
         order_size = self._round_quantity(self.config.fixed_order_size)
+        
+        # === 修复：添加 position_side 参数以支持双向持仓 ===
         buy = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
@@ -96,7 +98,9 @@ class GridEngine:
             quantity=order_size,
             price=self._round_price(prices["buy"]),
             time_in_force="GTC",
+            position_side="LONG"  # 开多单属于 LONG 方向
         )
+        
         sell = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
@@ -105,9 +109,12 @@ class GridEngine:
             quantity=order_size,
             price=self._round_price(prices["sell"]),
             time_in_force="GTC",
+            position_side="SHORT" # 开空单属于 SHORT 方向
         )
+        
         if not buy["ok"] or not sell["ok"]:
             raise RuntimeError(f"开仓单下单失败: buy={buy} sell={sell}")
+            
         self.state.buy_order_id = int(buy["data"]["orderId"])
         self.state.sell_order_id = int(sell["data"]["orderId"])
         self.state.last_center_price = center_price
@@ -120,17 +127,24 @@ class GridEngine:
             self._round_price(prices["sell"]),
         )
 
-    # === 修复点1：让止盈函数返回 OrderID，方便追踪 ===
     def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> int:
         step = entry_price * self._get_take_profit_step_ratio(side)
+        
+        # === 修复：根据持仓方向确定 position_side ===
         if side == "BUY":
+            # 之前是开多(BUY)，现在要平多，操作是卖(SELL)，持仓方向是 LONG
             tp_price = entry_price + step
             tp_side = "SELL"
+            pos_side = "LONG"
         else:
+            # 之前是开空(SELL)，现在要平空，操作是买(BUY)，持仓方向是 SHORT
             tp_price = entry_price - step
             tp_side = "BUY"
+            pos_side = "SHORT"
+            
         order_size = self._round_quantity(quantity)
         tp_price = self._round_price(tp_price)
+        
         result = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
@@ -139,8 +153,10 @@ class GridEngine:
             quantity=order_size,
             price=tp_price,
             time_in_force="GTC",
-            reduce_only=True,
+            reduce_only=True, # 依然保持只减仓
+            position_side=pos_side # 必须指定方向
         )
+        
         if not result["ok"]:
             raise RuntimeError(f"止盈单下单失败: {result}")
         order_id = int(result["data"]["orderId"])
@@ -155,6 +171,19 @@ class GridEngine:
         return order_id
 
     def initialize(self) -> None:
+        self.logger.info("正在初始化策略...")
+        
+        # === 新增：确保账户处于双向持仓模式 ===
+        try:
+            # 尝试设置为双向持仓 (True)
+            # 如果已经是双向持仓，API可能会报错 "No need to change position side."，这是正常的，可以忽略
+            res = sdk.change_position_mode(self.client, dual_side=True)
+            if not res['ok'] and res.get('status_code') != 400: 
+                # 400 通常意味着“不需要修改”，其他错误才打印警告
+                self.logger.warning(f"设置持仓模式警告: {res}")
+        except Exception as e:
+            self.logger.warning(f"设置持仓模式异常 (如果是 'No need to change' 可忽略): {e}")
+
         center_price = self._get_current_price()
         self._place_opening_orders(center_price)
 
@@ -167,14 +196,12 @@ class GridEngine:
             return
         self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
 
-    # === 修复点2：参数补全，且只负责清理工作，不负责止盈 ===
     def _handle_filled_order(self, order_id: int, side: str, price: float, quantity: float) -> None:
         self.logger.info(
             "成交 order_id=%s side=%s price=%.4f qty=%.4f", order_id, side, price, quantity
         )
         self.state.last_entry_price[side] = price
         self.state.last_entry_quantity[side] = quantity
-        # 轮询不挂止盈，只把 ID 置空，等着 _ensure_take_profit_orders 去检查
         self.state.tp_order_id[side] = None 
         
         if side == "BUY":
@@ -183,7 +210,6 @@ class GridEngine:
             self._cancel_opposite(self.state.buy_order_id)
         self._place_opening_orders(price)
 
-    # === 修复点3：WS 成交处理，负责挂止盈并记录 ID ===
     def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
         if quantity <= 0:
             return
@@ -200,33 +226,27 @@ class GridEngine:
             side=side, entry_price=price, quantity=quantity
         )
 
-    # === 修复点4：补上了缺失的“安全带”函数 ===
     def _ensure_take_profit_orders(self, open_ids: set[int]) -> None:
         for side in ("BUY", "SELL"):
             entry_price = self.state.last_entry_price.get(side)
             entry_qty = self.state.last_entry_quantity.get(side)
             
-            # 如果没有持仓信息，说明还没成交，不用管
             if not entry_price or not entry_qty:
                 continue
                 
             tp_order_id = self.state.tp_order_id.get(side)
             
-            # 如果记录的止盈单ID还在挂单列表里，说明一切正常，不用管
             if tp_order_id and tp_order_id in open_ids:
                 continue
             
-            # 如果ID不在列表里，查一下是不是已经成交了（也许止盈都止完了）
             if tp_order_id:
                 tp_order = sdk.get_order(
                     self.client, symbol=self.config.symbol, order_id=tp_order_id
                 )
                 if tp_order["ok"] and tp_order["data"].get("status") == "FILLED":
                     continue
-                # 如果没成交也不在列表里，说明被撤了或者出问题了，重置ID准备补单
                 self.state.tp_order_id[side] = None
             
-            # 补挂止盈单
             self.logger.info(
                 "检测到止盈单缺失 entry_side=%s entry_price=%.4f qty=%.4f，重新下单",
                 side,
@@ -255,10 +275,8 @@ class GridEngine:
             if status == "FILLED":
                 fill_price = float(order["data"].get("avgPrice") or order["data"].get("price"))
                 fill_qty = float(order["data"].get("executedQty") or 0)
-                # 这里的参数匹配现在对了
                 self._handle_filled_order(order_id, side, fill_price, fill_qty)
         
-        # 这个函数现在也有了
         self._ensure_take_profit_orders(open_ids)
 
     def run_order_loop(self) -> None:
