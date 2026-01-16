@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
@@ -34,6 +34,15 @@ class GridOrderState:
     buy_order_id: Optional[int] = None
     sell_order_id: Optional[int] = None
     last_center_price: Optional[float] = None
+    last_entry_price: Dict[str, Optional[float]] = field(
+        default_factory=lambda: {"BUY": None, "SELL": None}
+    )
+    last_entry_quantity: Dict[str, Optional[float]] = field(
+        default_factory=lambda: {"BUY": None, "SELL": None}
+    )
+    tp_order_id: Dict[str, Optional[int]] = field(
+        default_factory=lambda: {"BUY": None, "SELL": None}
+    )
 
 
 class GridEngine:
@@ -111,7 +120,8 @@ class GridEngine:
             self._round_price(prices["sell"]),
         )
 
-    def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> None:
+    # === 修复点1：让止盈函数返回 OrderID，方便追踪 ===
+    def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> int:
         step = entry_price * self._get_take_profit_step_ratio(side)
         if side == "BUY":
             tp_price = entry_price + step
@@ -133,6 +143,7 @@ class GridEngine:
         )
         if not result["ok"]:
             raise RuntimeError(f"止盈单下单失败: {result}")
+        order_id = int(result["data"]["orderId"])
         self.logger.info(
             "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f qty=%.2f order=%s",
             side,
@@ -141,6 +152,7 @@ class GridEngine:
             order_size,
             result["data"],
         )
+        return order_id
 
     def initialize(self) -> None:
         center_price = self._get_current_price()
@@ -155,14 +167,23 @@ class GridEngine:
             return
         self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
 
-    def _handle_filled_order(self, order_id: int, side: str, price: float) -> None:
-        self.logger.info("成交 order_id=%s side=%s price=%.4f", order_id, side, price)
+    # === 修复点2：参数补全，且只负责清理工作，不负责止盈 ===
+    def _handle_filled_order(self, order_id: int, side: str, price: float, quantity: float) -> None:
+        self.logger.info(
+            "成交 order_id=%s side=%s price=%.4f qty=%.4f", order_id, side, price, quantity
+        )
+        self.state.last_entry_price[side] = price
+        self.state.last_entry_quantity[side] = quantity
+        # 轮询不挂止盈，只把 ID 置空，等着 _ensure_take_profit_orders 去检查
+        self.state.tp_order_id[side] = None 
+        
         if side == "BUY":
             self._cancel_opposite(self.state.sell_order_id)
         else:
             self._cancel_opposite(self.state.buy_order_id)
         self._place_opening_orders(price)
 
+    # === 修复点3：WS 成交处理，负责挂止盈并记录 ID ===
     def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
         if quantity <= 0:
             return
@@ -173,7 +194,48 @@ class GridEngine:
             price,
             quantity,
         )
-        self._place_take_profit(side=side, entry_price=price, quantity=quantity)
+        self.state.last_entry_price[side] = price
+        self.state.last_entry_quantity[side] = quantity
+        self.state.tp_order_id[side] = self._place_take_profit(
+            side=side, entry_price=price, quantity=quantity
+        )
+
+    # === 修复点4：补上了缺失的“安全带”函数 ===
+    def _ensure_take_profit_orders(self, open_ids: set[int]) -> None:
+        for side in ("BUY", "SELL"):
+            entry_price = self.state.last_entry_price.get(side)
+            entry_qty = self.state.last_entry_quantity.get(side)
+            
+            # 如果没有持仓信息，说明还没成交，不用管
+            if not entry_price or not entry_qty:
+                continue
+                
+            tp_order_id = self.state.tp_order_id.get(side)
+            
+            # 如果记录的止盈单ID还在挂单列表里，说明一切正常，不用管
+            if tp_order_id and tp_order_id in open_ids:
+                continue
+            
+            # 如果ID不在列表里，查一下是不是已经成交了（也许止盈都止完了）
+            if tp_order_id:
+                tp_order = sdk.get_order(
+                    self.client, symbol=self.config.symbol, order_id=tp_order_id
+                )
+                if tp_order["ok"] and tp_order["data"].get("status") == "FILLED":
+                    continue
+                # 如果没成交也不在列表里，说明被撤了或者出问题了，重置ID准备补单
+                self.state.tp_order_id[side] = None
+            
+            # 补挂止盈单
+            self.logger.info(
+                "检测到止盈单缺失 entry_side=%s entry_price=%.4f qty=%.4f，重新下单",
+                side,
+                entry_price,
+                entry_qty,
+            )
+            self.state.tp_order_id[side] = self._place_take_profit(
+                side=side, entry_price=entry_price, quantity=entry_qty
+            )
 
     def sync_once(self) -> None:
         open_orders = sdk.get_open_orders(self.client, symbol=self.config.symbol)
@@ -192,7 +254,12 @@ class GridEngine:
             status = order["data"].get("status")
             if status == "FILLED":
                 fill_price = float(order["data"].get("avgPrice") or order["data"].get("price"))
-                self._handle_filled_order(order_id, side, fill_price)
+                fill_qty = float(order["data"].get("executedQty") or 0)
+                # 这里的参数匹配现在对了
+                self._handle_filled_order(order_id, side, fill_price, fill_qty)
+        
+        # 这个函数现在也有了
+        self._ensure_take_profit_orders(open_ids)
 
     def run_order_loop(self) -> None:
         while not self.stop_event.is_set():
