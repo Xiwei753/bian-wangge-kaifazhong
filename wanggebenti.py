@@ -49,6 +49,9 @@ class GridEngine:
         self.state = GridOrderState()
         self.stop_event = threading.Event()
 
+    def _round_order_value(self, value: float) -> float:
+        return round(value, 1)
+
     def _get_current_price(self) -> float:
         result = sdk.get_ticker_price(self.client, self.config.symbol)
         if not result["ok"]:
@@ -72,13 +75,14 @@ class GridEngine:
 
     def _place_opening_orders(self, center_price: float) -> None:
         prices = self._calc_grid_prices(center_price)
+        order_size = self._round_order_value(self.config.fixed_order_size)
         buy = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
             side="BUY",
             order_type="LIMIT",
-            quantity=self.config.fixed_order_size,
-            price=prices["buy"],
+            quantity=order_size,
+            price=self._round_order_value(prices["buy"]),
             time_in_force="GTC",
         )
         sell = sdk.new_order(
@@ -86,8 +90,8 @@ class GridEngine:
             symbol=self.config.symbol,
             side="SELL",
             order_type="LIMIT",
-            quantity=self.config.fixed_order_size,
-            price=prices["sell"],
+            quantity=order_size,
+            price=self._round_order_value(prices["sell"]),
             time_in_force="GTC",
         )
         if not buy["ok"] or not sell["ok"]:
@@ -100,8 +104,8 @@ class GridEngine:
             center_price,
             self.state.buy_order_id,
             self.state.sell_order_id,
-            prices["buy"],
-            prices["sell"],
+            self._round_order_value(prices["buy"]),
+            self._round_order_value(prices["sell"]),
         )
 
     def _place_take_profit(self, side: str, entry_price: float) -> None:
@@ -112,12 +116,14 @@ class GridEngine:
         else:
             tp_price = entry_price - step
             tp_side = "BUY"
+        order_size = self._round_order_value(self.config.fixed_order_size)
+        tp_price = self._round_order_value(tp_price)
         result = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
             side=tp_side,
             order_type="LIMIT",
-            quantity=self.config.fixed_order_size,
+            quantity=order_size,
             price=tp_price,
             time_in_force="GTC",
             reduce_only=True,
