@@ -361,10 +361,19 @@ def cancel_all_orders(client: UMFutures, symbol: str) -> Dict[str, Any]:
     return _call(client.cancel_open_orders, symbol=symbol)
 
 
+# ===================== get_open_orders (手动修复版) =====================
 def get_open_orders(client: UMFutures, symbol: Optional[str] = None) -> Dict[str, Any]:
-    return _call(client.get_open_orders, symbol=symbol)
+    # 绕过 binance-futures-connector 的 orderId 必填 Bug
+    def safe_get_open_orders(symbol_arg):
+        params = {}
+        if symbol_arg:
+            params["symbol"] = symbol_arg
+        return client.sign_request("GET", "/fapi/v1/openOrders", params)
+    return _call(safe_get_open_orders, symbol)
+# =========================================================================
 
 
+# ===================== 【关键修复】使用 query_order 而非 get_order =====================
 def get_order(
     client: UMFutures,
     symbol: str,
@@ -376,14 +385,18 @@ def get_order(
         params["orderId"] = order_id
     if orig_client_order_id is not None:
         params["origClientOrderId"] = orig_client_order_id
-    return _call(client.get_order, **params)
+    
+    # ▼▼▼▼▼▼ 核心修改：这里必须用 query_order ▼▼▼▼▼▼
+    # 官方库 (binance-connector) 对应的方法名是 query_order
+    # 而非第三方库 (python-binance) 的 get_order
+    return _call(client.query_order, **params)
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 
 def get_all_orders(
     client: UMFutures, symbol: str, limit: int = 500
 ) -> Dict[str, Any]:
     return _call_method(client, "get_all_orders", symbol=symbol, limit=limit)
-
 
 
 def get_income_history(
@@ -433,7 +446,7 @@ def subscribe_depth_ws(
     on_error: Optional[Callable[[websocket.WebSocketApp, Exception], None]] = None,
     on_close: Optional[Callable[[websocket.WebSocketApp, int, str], None]] = None,
     on_open: Optional[Callable[[websocket.WebSocketApp], None]] = None,
-    ) -> websocket.WebSocketApp:
+) -> websocket.WebSocketApp:
     """订阅指定交易对的盘口深度数据，返回 WebSocketApp 实例。"""
     stream = build_depth_stream_name(symbol, depth_level=depth_level, speed_ms=speed_ms)
     ws_url = f"{get_ws_base_url(use_testnet=use_testnet)}/{stream}"
