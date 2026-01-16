@@ -49,8 +49,11 @@ class GridEngine:
         self.state = GridOrderState()
         self.stop_event = threading.Event()
 
-    def _round_order_value(self, value: float) -> float:
+    def _round_price(self, value: float) -> float:
         return round(value, 1)
+
+    def _round_quantity(self, value: float) -> float:
+        return round(value, 2)
 
     def _get_current_price(self) -> float:
         result = sdk.get_ticker_price(self.client, self.config.symbol)
@@ -75,14 +78,14 @@ class GridEngine:
 
     def _place_opening_orders(self, center_price: float) -> None:
         prices = self._calc_grid_prices(center_price)
-        order_size = self._round_order_value(self.config.fixed_order_size)
+        order_size = self._round_quantity(self.config.fixed_order_size)
         buy = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
             side="BUY",
             order_type="LIMIT",
             quantity=order_size,
-            price=self._round_order_value(prices["buy"]),
+            price=self._round_price(prices["buy"]),
             time_in_force="GTC",
         )
         sell = sdk.new_order(
@@ -91,7 +94,7 @@ class GridEngine:
             side="SELL",
             order_type="LIMIT",
             quantity=order_size,
-            price=self._round_order_value(prices["sell"]),
+            price=self._round_price(prices["sell"]),
             time_in_force="GTC",
         )
         if not buy["ok"] or not sell["ok"]:
@@ -104,11 +107,11 @@ class GridEngine:
             center_price,
             self.state.buy_order_id,
             self.state.sell_order_id,
-            self._round_order_value(prices["buy"]),
-            self._round_order_value(prices["sell"]),
+            self._round_price(prices["buy"]),
+            self._round_price(prices["sell"]),
         )
 
-    def _place_take_profit(self, side: str, entry_price: float) -> None:
+    def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> None:
         step = entry_price * self._get_take_profit_step_ratio(side)
         if side == "BUY":
             tp_price = entry_price + step
@@ -116,8 +119,8 @@ class GridEngine:
         else:
             tp_price = entry_price - step
             tp_side = "BUY"
-        order_size = self._round_order_value(self.config.fixed_order_size)
-        tp_price = self._round_order_value(tp_price)
+        order_size = self._round_quantity(quantity)
+        tp_price = self._round_price(tp_price)
         result = sdk.new_order(
             self.client,
             symbol=self.config.symbol,
@@ -131,10 +134,11 @@ class GridEngine:
         if not result["ok"]:
             raise RuntimeError(f"止盈单下单失败: {result}")
         self.logger.info(
-            "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f order=%s",
+            "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f qty=%.2f order=%s",
             side,
             tp_side,
             tp_price,
+            order_size,
             result["data"],
         )
 
@@ -153,12 +157,23 @@ class GridEngine:
 
     def _handle_filled_order(self, order_id: int, side: str, price: float) -> None:
         self.logger.info("成交 order_id=%s side=%s price=%.4f", order_id, side, price)
-        self._place_take_profit(side=side, entry_price=price)
         if side == "BUY":
             self._cancel_opposite(self.state.sell_order_id)
         else:
             self._cancel_opposite(self.state.buy_order_id)
         self._place_opening_orders(price)
+
+    def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
+        if quantity <= 0:
+            return
+        self.logger.info(
+            "WS成交 order_id=%s side=%s price=%.4f qty=%.4f",
+            order_id,
+            side,
+            price,
+            quantity,
+        )
+        self._place_take_profit(side=side, entry_price=price, quantity=quantity)
 
     def sync_once(self) -> None:
         open_orders = sdk.get_open_orders(self.client, symbol=self.config.symbol)
@@ -226,7 +241,9 @@ def _run_depth_ws(config: GridConfig, stop_event: threading.Event) -> None:
     ws_app.close()
 
 
-def _handle_user_data_message(logger: logging.Logger, message: str) -> None:
+def _handle_user_data_message(
+    engine: GridEngine, logger: logging.Logger, message: str
+) -> None:
     try:
         payload = json.loads(message)
     except json.JSONDecodeError:
@@ -235,16 +252,26 @@ def _handle_user_data_message(logger: logging.Logger, message: str) -> None:
     event_type = payload.get("e")
     if event_type == "ORDER_TRADE_UPDATE":
         order = payload.get("o", {})
+        exec_type = order.get("x")
+        last_qty = float(order.get("l") or 0)
+        avg_price = float(order.get("ap") or 0)
         logger.info(
             "订单更新 order_id=%s symbol=%s side=%s status=%s exec_type=%s avg_price=%s last_qty=%s",
             order.get("i"),
             order.get("s"),
             order.get("S"),
             order.get("X"),
-            order.get("x"),
-            order.get("ap"),
-            order.get("l"),
+            exec_type,
+            avg_price,
+            last_qty,
         )
+        if exec_type == "TRADE" and last_qty > 0 and avg_price > 0:
+            engine.handle_ws_fill(
+                order_id=int(order.get("i")),
+                side=str(order.get("S")),
+                price=avg_price,
+                quantity=last_qty,
+            )
     else:
         logger.debug("用户数据流事件=%s payload=%s", event_type, payload)
 
@@ -256,7 +283,7 @@ def _run_user_data_ws(
     logger = logging.getLogger("UserDataWS")
 
     def on_message(_: sdk.websocket.WebSocketApp, message: str) -> None:
-        _handle_user_data_message(logger, message)
+        _handle_user_data_message(engine, logger, message)
 
     def on_error(_: sdk.websocket.WebSocketApp, error: Exception) -> None:
         logger.error("用户数据 WS 错误: %s", error)
