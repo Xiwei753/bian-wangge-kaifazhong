@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import importlib.util
 import threading
 import time
@@ -42,6 +42,10 @@ class GridOrderState:
     )
     tp_order_id: Dict[str, Optional[int]] = field(
         default_factory=lambda: {"BUY": None, "SELL": None}
+    )
+    # 新增：记录最后成交的时间戳 (毫秒)
+    last_fill_time: Dict[str, int] = field(
+        default_factory=lambda: {"BUY": 0, "SELL": 0}
     )
 
 
@@ -80,57 +84,76 @@ class GridEngine:
             return self.config.short_open_long_tp_step_ratio
         return self.config.long_open_short_tp_step_ratio
 
-    def _calc_grid_prices(self, center_price: float) -> Dict[str, float]:
-        buy_step = center_price * self._get_open_step_ratio("BUY")
-        sell_step = center_price * self._get_open_step_ratio("SELL")
-        return {"buy": center_price - buy_step, "sell": center_price + sell_step}
+    def _decide_grid_steps(self, center_price: float) -> Tuple[Optional[float], Optional[float]]:
+        default_buy_step = center_price * self._get_open_step_ratio("BUY")
+        default_sell_step = center_price * self._get_open_step_ratio("SELL")
+
+        current_score = 0.5 
+        threshold = 0.7
+        current_direction = "UP" 
+
+        if current_score < threshold:
+            return default_buy_step, default_sell_step
+        else:
+            if current_direction == "UP":
+                return default_buy_step, None
+            else:
+                return None, default_sell_step
 
     def _place_opening_orders(self, center_price: float) -> None:
-        prices = self._calc_grid_prices(center_price)
+        buy_step, sell_step = self._decide_grid_steps(center_price)
         order_size = self._round_quantity(self.config.fixed_order_size)
         
-        # === 双向持仓开单 ===
-        buy = sdk.new_order(
-            self.client,
-            symbol=self.config.symbol,
-            side="BUY",
-            order_type="LIMIT",
-            quantity=order_size,
-            price=self._round_price(prices["buy"]),
-            time_in_force="GTC",
-            position_side="LONG"
-        )
-        
-        sell = sdk.new_order(
-            self.client,
-            symbol=self.config.symbol,
-            side="SELL",
-            order_type="LIMIT",
-            quantity=order_size,
-            price=self._round_price(prices["sell"]),
-            time_in_force="GTC",
-            position_side="SHORT"
-        )
-        
-        if not buy["ok"] or not sell["ok"]:
-            raise RuntimeError(f"开仓单下单失败: buy={buy} sell={sell}")
-            
-        self.state.buy_order_id = int(buy["data"]["orderId"])
-        self.state.sell_order_id = int(sell["data"]["orderId"])
-        self.state.last_center_price = center_price
-        self.logger.info(
-            "开仓挂单完成 center=%.4f buy_id=%s sell_id=%s buy_price=%.4f sell_price=%.4f",
-            center_price,
-            self.state.buy_order_id,
-            self.state.sell_order_id,
-            self._round_price(prices["buy"]),
-            self._round_price(prices["sell"]),
-        )
+        if buy_step is not None:
+            buy_price = center_price - buy_step
+            buy = sdk.new_order(
+                self.client,
+                symbol=self.config.symbol,
+                side="BUY",
+                order_type="LIMIT",
+                quantity=order_size,
+                price=self._round_price(buy_price),
+                time_in_force="GTC",
+                position_side="LONG"
+            )
+            if buy["ok"]:
+                self.state.buy_order_id = int(buy["data"]["orderId"])
+                self.logger.info(f"挂买单成功: 价格 {self._round_price(buy_price)}")
+            else:
+                self.logger.error(f"挂买单失败: {buy}")
 
-    def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> int:
+        if sell_step is not None:
+            sell_price = center_price + sell_step
+            sell = sdk.new_order(
+                self.client,
+                symbol=self.config.symbol,
+                side="SELL",
+                order_type="LIMIT",
+                quantity=order_size,
+                price=self._round_price(sell_price),
+                time_in_force="GTC",
+                position_side="SHORT"
+            )
+            if sell["ok"]:
+                self.state.sell_order_id = int(sell["data"]["orderId"])
+                self.logger.info(f"挂卖单成功: 价格 {self._round_price(sell_price)}")
+            else:
+                self.logger.error(f"挂卖单失败: {sell}")
+
+    def _get_position_amount(self, position_side: str) -> float:
+        res = sdk.get_position_risk(self.client, symbol=self.config.symbol)
+        if not res["ok"]:
+            self.logger.warning(f"查询持仓失败: {res}")
+            return 0.0
+        
+        for pos in res["data"]:
+            if pos["positionSide"] == position_side:
+                return abs(float(pos["positionAmt"]))
+        return 0.0
+
+    def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> Optional[int]:
         step = entry_price * self._get_take_profit_step_ratio(side)
         
-        # === 双向持仓止盈 ===
         if side == "BUY":
             tp_price = entry_price + step
             tp_side = "SELL"
@@ -140,7 +163,16 @@ class GridEngine:
             tp_side = "BUY"
             pos_side = "SHORT"
             
-        order_size = self._round_quantity(quantity)
+        real_position = self._get_position_amount(pos_side)
+        if real_position == 0:
+            self.logger.warning(f"【严重警告】试图挂止盈单，但真实持仓为0！已取消下单。PosSide={pos_side}")
+            self.state.last_entry_price[side] = None
+            self.state.last_entry_quantity[side] = None
+            self.state.tp_order_id[side] = None
+            return None
+
+        actual_qty = min(quantity, real_position)
+        order_size = self._round_quantity(actual_qty)
         tp_price = self._round_price(tp_price)
         
         result = sdk.new_order(
@@ -151,7 +183,6 @@ class GridEngine:
             quantity=order_size,
             price=tp_price,
             time_in_force="GTC",
-            # reduce_only=True,  <--- 【关键修改】在双向持仓模式(Hedge Mode)下，必须删掉这行！
             position_side=pos_side
         )
         
@@ -203,9 +234,10 @@ class GridEngine:
             self._cancel_opposite(self.state.buy_order_id)
         self._place_opening_orders(price)
 
-    def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
+    def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float, event_time: int) -> None:
         if quantity <= 0:
             return
+        
         self.logger.info(
             "WS成交 order_id=%s side=%s price=%.4f qty=%.4f",
             order_id,
@@ -215,6 +247,10 @@ class GridEngine:
         )
         self.state.last_entry_price[side] = price
         self.state.last_entry_quantity[side] = quantity
+        # 记录成交时间戳
+        self.state.last_fill_time[side] = event_time
+        
+        # WS 负责极速下单 (既然有5秒保护，这里可以放心大胆地开火了！)
         self.state.tp_order_id[side] = self._place_take_profit(
             side=side, entry_price=price, quantity=quantity
         )
@@ -227,10 +263,18 @@ class GridEngine:
             if not entry_price or not entry_qty:
                 continue
                 
+            # ▼▼▼▼▼▼ 核心：5秒冷却时间锁 ▼▼▼▼▼▼
+            last_time = self.state.last_fill_time.get(side) or 0
+            current_time = int(time.time() * 1000)
+            
+            # 如果成交在5秒内，主循环什么都不做，完全信任 WS
+            if current_time - last_time < 5000:
+                continue
+            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+                
             tp_order_id = self.state.tp_order_id.get(side)
             
             if tp_order_id:
-                # 定向查询，避开 get_open_orders
                 tp_order = sdk.get_order(
                     self.client, symbol=self.config.symbol, order_id=tp_order_id
                 )
@@ -241,14 +285,14 @@ class GridEngine:
                     if status == "FILLED":
                         self.state.tp_order_id[side] = None
                         continue
-                    self.state.tp_order_id[side] = None # 被撤单或其他异常，重置以补单
+                    self.state.tp_order_id[side] = None 
                 else:
-                    self.logger.warning(f"查询止盈单失败: {tp_order}")
-                    self.state.tp_order_id[side] = None
+                    # 查单失败不置空，等待下次重试
+                    self.logger.warning(f"查询止盈单失败 (保留ID待下次重试): {tp_order}")
+                    continue
 
-            # 补挂止盈单
             self.logger.info(
-                "检测到止盈单缺失 entry_side=%s entry_price=%.4f qty=%.4f，重新下单",
+                "检测到止盈单缺失 (已过5秒安全期) entry_side=%s entry_price=%.4f qty=%.4f，补单",
                 side,
                 entry_price,
                 entry_qty,
@@ -258,7 +302,6 @@ class GridEngine:
             )
 
     def sync_once(self) -> None:
-        # 定向查询开仓单
         target_orders = [
             (self.state.buy_order_id, "BUY"),
             (self.state.sell_order_id, "SELL")
@@ -276,6 +319,11 @@ class GridEngine:
             if status == "FILLED":
                 fill_price = float(order["data"].get("avgPrice") or order["data"].get("price"))
                 fill_qty = float(order["data"].get("executedQty") or 0)
+                
+                # 同步时也更新时间戳
+                update_time = int(order["data"].get("updateTime") or 0)
+                self.state.last_fill_time[side] = update_time
+                
                 self._handle_filled_order(order_id, side, fill_price, fill_qty)
         
         self._ensure_take_profit_orders()
@@ -341,6 +389,8 @@ def _handle_user_data_message(
         exec_type = order.get("x")
         last_qty = float(order.get("l") or 0)
         avg_price = float(order.get("ap") or 0)
+        event_time = int(payload.get("E") or 0) # 获取事件时间戳
+        
         logger.info(
             "订单更新 order_id=%s symbol=%s side=%s status=%s exec_type=%s avg_price=%s last_qty=%s",
             order.get("i"),
@@ -357,9 +407,27 @@ def _handle_user_data_message(
                 side=str(order.get("S")),
                 price=avg_price,
                 quantity=last_qty,
+                event_time=event_time, # 传进去
             )
     else:
         logger.debug("用户数据流事件=%s payload=%s", event_type, payload)
+
+
+# === 保活线程 ===
+def _keep_stream_alive(engine: GridEngine, listen_key: str, stop_event: threading.Event):
+    logger = logging.getLogger("KeepAlive")
+    logger.info("启动 User Data Stream 保活线程 (每30分钟续期一次)")
+    while not stop_event.is_set():
+        for _ in range(1800): 
+            if stop_event.is_set(): return
+            time.sleep(1)
+        try:
+            logger.info(f"正在续期 ListenKey: {listen_key[:6]}...")
+            res = sdk.renew_listen_key(engine.client, listen_key)
+            if res["ok"]: logger.info("ListenKey 续期成功！")
+            else: logger.warning(f"ListenKey 续期失败: {res}")
+        except Exception as e:
+            logger.error(f"保活线程异常: {e}")
 
 
 def _run_user_data_ws(
@@ -391,6 +459,16 @@ def _run_user_data_ws(
             logger.error("listenKey 为空: %s", listen_key_result)
             time.sleep(5)
             continue
+            
+        keep_alive_stop = threading.Event()
+        keep_alive_thread = threading.Thread(
+            target=_keep_stream_alive,
+            args=(engine, listen_key, keep_alive_stop),
+            daemon=True,
+            name="KeepAlive"
+        )
+        keep_alive_thread.start()
+        
         ws_app = sdk.subscribe_user_data_ws(
             listen_key=listen_key,
             on_message=on_message,
@@ -400,6 +478,9 @@ def _run_user_data_ws(
             on_open=on_open,
         )
         ws_app.run_forever(ping_interval=20, ping_timeout=10)
+        
+        keep_alive_stop.set()
+        
         if stop_event.is_set():
             break
         logger.warning("用户数据 WS 断开，5秒后重连")
