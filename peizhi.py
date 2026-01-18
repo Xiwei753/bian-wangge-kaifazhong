@@ -30,6 +30,7 @@ class GridConfig:
         self.enable_short: bool = True
         self.enable_flexible_tp: bool = True
         self.enable_profit_stop_for_trapped: bool = True
+        self.enable_polling_after_ws_fill: bool = True
 
         # ===================== 网格基础参数 =====================
         self.grid_count: int = 3
