@@ -241,13 +241,12 @@ class GridEngine:
         )
         self.state.last_entry_price[side] = price
         self.state.last_entry_quantity[side] = quantity
-        self.state.tp_order_id[side] = None 
+        self.state.tp_order_id[side] = None
         self.state.last_filled_side = side
         if side == "BUY":
             self.state.buy_order_id = None
         else:
             self.state.sell_order_id = None
-        
         if side == "BUY":
             self._cancel_opposite(self.state.sell_order_id)
         else:
@@ -275,8 +274,13 @@ class GridEngine:
             self.state.buy_order_id = None
         else:
             self.state.sell_order_id = None
-        
-        # WS 负责极速下单 (既然有5秒保护，这里可以放心大胆地开火了！)
+        if side == "BUY":
+            self._cancel_opposite(self.state.sell_order_id)
+        else:
+            self._cancel_opposite(self.state.buy_order_id)
+        self._place_opening_orders(price)
+
+        # WS 负责下单/撤单/止盈
         self.state.tp_order_id[side] = self._place_take_profit(
             side=side, entry_price=price, quantity=quantity
         )
