@@ -14,6 +14,7 @@ import threading
 import time
 
 from peizhi import GridConfig
+from zhiyingguanli import TakeProfitRegistry
 
 
 def _load_sdk_module():
@@ -43,6 +44,7 @@ class GridOrderState:
     tp_order_id: Dict[str, Optional[int]] = field(
         default_factory=lambda: {"BUY": None, "SELL": None}
     )
+    last_filled_side: Optional[str] = None
     # 新增：记录最后成交的时间戳 (毫秒)
     last_fill_time: Dict[str, int] = field(
         default_factory=lambda: {"BUY": 0, "SELL": 0}
@@ -60,7 +62,9 @@ class GridEngine:
             timeout=config.request_timeout,
         )
         self.state = GridOrderState()
+        self.tp_registry = TakeProfitRegistry()
         self.stop_event = threading.Event()
+        self.polling_active = False
 
     def _round_price(self, value: float) -> float:
         return round(value, 1)
@@ -103,6 +107,7 @@ class GridEngine:
     def _place_opening_orders(self, center_price: float) -> None:
         buy_step, sell_step = self._decide_grid_steps(center_price)
         order_size = self._round_quantity(self.config.fixed_order_size)
+        self.state.last_center_price = self._round_price(center_price)
         
         if buy_step is not None:
             buy_price = center_price - buy_step
@@ -121,6 +126,8 @@ class GridEngine:
                 self.logger.info(f"挂买单成功: 价格 {self._round_price(buy_price)}")
             else:
                 self.logger.error(f"挂买单失败: {buy}")
+        else:
+            self.state.buy_order_id = None
 
         if sell_step is not None:
             sell_price = center_price + sell_step
@@ -139,6 +146,8 @@ class GridEngine:
                 self.logger.info(f"挂卖单成功: 价格 {self._round_price(sell_price)}")
             else:
                 self.logger.error(f"挂卖单失败: {sell}")
+        else:
+            self.state.sell_order_id = None
 
     def _get_position_amount(self, position_side: str) -> float:
         res = sdk.get_position_risk(self.client, symbol=self.config.symbol)
@@ -189,6 +198,12 @@ class GridEngine:
         if not result["ok"]:
             raise RuntimeError(f"止盈单下单失败: {result}")
         order_id = int(result["data"]["orderId"])
+        self.tp_registry.add_record(
+            order_id=order_id,
+            price=tp_price,
+            entry_side=side,
+            tp_side=tp_side,
+        )
         self.logger.info(
             "止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f qty=%.2f order=%s",
             side,
@@ -226,8 +241,12 @@ class GridEngine:
         )
         self.state.last_entry_price[side] = price
         self.state.last_entry_quantity[side] = quantity
-        self.state.tp_order_id[side] = None 
-        
+        self.state.tp_order_id[side] = None
+        self.state.last_filled_side = side
+        if side == "BUY":
+            self.state.buy_order_id = None
+        else:
+            self.state.sell_order_id = None
         if side == "BUY":
             self._cancel_opposite(self.state.sell_order_id)
         else:
@@ -247,10 +266,21 @@ class GridEngine:
         )
         self.state.last_entry_price[side] = price
         self.state.last_entry_quantity[side] = quantity
+        self.state.last_filled_side = side
         # 记录成交时间戳
         self.state.last_fill_time[side] = event_time
-        
-        # WS 负责极速下单 (既然有5秒保护，这里可以放心大胆地开火了！)
+        self.polling_active = self.config.enable_polling_after_ws_fill
+        if side == "BUY":
+            self.state.buy_order_id = None
+        else:
+            self.state.sell_order_id = None
+        if side == "BUY":
+            self._cancel_opposite(self.state.sell_order_id)
+        else:
+            self._cancel_opposite(self.state.buy_order_id)
+        self._place_opening_orders(price)
+
+        # WS 负责下单/撤单/止盈
         self.state.tp_order_id[side] = self._place_take_profit(
             side=side, entry_price=price, quantity=quantity
         )
@@ -283,8 +313,10 @@ class GridEngine:
                     if status in ["NEW", "PARTIALLY_FILLED"]:
                         continue 
                     if status == "FILLED":
+                        self.tp_registry.remove_record(tp_order_id)
                         self.state.tp_order_id[side] = None
                         continue
+                    self.tp_registry.remove_record(tp_order_id)
                     self.state.tp_order_id[side] = None 
                 else:
                     # 查单失败不置空，等待下次重试
@@ -302,29 +334,39 @@ class GridEngine:
             )
 
     def sync_once(self) -> None:
-        target_orders = [
-            (self.state.buy_order_id, "BUY"),
-            (self.state.sell_order_id, "SELL")
-        ]
-        
-        for order_id, side in target_orders:
-            if order_id is None:
-                continue
-            
-            order = sdk.get_order(self.client, symbol=self.config.symbol, order_id=order_id)
-            if not order["ok"]:
-                continue
-                
-            status = order["data"].get("status")
-            if status == "FILLED":
-                fill_price = float(order["data"].get("avgPrice") or order["data"].get("price"))
-                fill_qty = float(order["data"].get("executedQty") or 0)
-                
-                # 同步时也更新时间戳
-                update_time = int(order["data"].get("updateTime") or 0)
-                self.state.last_fill_time[side] = update_time
-                
-                self._handle_filled_order(order_id, side, fill_price, fill_qty)
+        if not self.config.enable_polling_after_ws_fill or not self.polling_active:
+            return
+        filled_side = self.state.last_filled_side
+        if filled_side not in ("BUY", "SELL"):
+            return
+        pending_side = "SELL" if filled_side == "BUY" else "BUY"
+        pending_order_id = (
+            self.state.sell_order_id if pending_side == "SELL" else self.state.buy_order_id
+        )
+        if pending_order_id is not None:
+            order = sdk.get_order(self.client, symbol=self.config.symbol, order_id=pending_order_id)
+            if order["ok"]:
+                status = order["data"].get("status")
+                if status in ["NEW", "PARTIALLY_FILLED"]:
+                    self._cancel_opposite(pending_order_id)
+                elif status == "FILLED":
+                    fill_price = float(order["data"].get("avgPrice") or order["data"].get("price"))
+                    fill_qty = float(order["data"].get("executedQty") or 0)
+                    update_time = int(order["data"].get("updateTime") or 0)
+                    self.state.last_fill_time[pending_side] = update_time
+                    self._handle_filled_order(pending_order_id, pending_side, fill_price, fill_qty)
+                else:
+                    if pending_side == "SELL":
+                        self.state.sell_order_id = None
+                    else:
+                        self.state.buy_order_id = None
+
+        entry_price = self.state.last_entry_price.get(filled_side)
+        if entry_price:
+            rounded_entry = self._round_price(entry_price)
+            if self.state.last_center_price != rounded_entry:
+                self.logger.info("检测到网格未按成交价部署，重新挂网格开仓单: %.4f", entry_price)
+                self._place_opening_orders(entry_price)
         
         self._ensure_take_profit_orders()
 
@@ -389,26 +431,33 @@ def _handle_user_data_message(
         exec_type = order.get("x")
         last_qty = float(order.get("l") or 0)
         avg_price = float(order.get("ap") or 0)
+        order_id = int(order.get("i") or 0)
+        status = order.get("X")
         event_time = int(payload.get("E") or 0) # 获取事件时间戳
         
         logger.info(
             "订单更新 order_id=%s symbol=%s side=%s status=%s exec_type=%s avg_price=%s last_qty=%s",
-            order.get("i"),
+            order_id,
             order.get("s"),
             order.get("S"),
-            order.get("X"),
+            status,
             exec_type,
             avg_price,
             last_qty,
         )
+        if order_id and engine.tp_registry.has_record(order_id):
+            if status in ["FILLED", "CANCELED", "EXPIRED", "REJECTED"]:
+                engine.tp_registry.remove_record(order_id)
+        is_opening_order = order_id in (engine.state.buy_order_id, engine.state.sell_order_id)
         if exec_type == "TRADE" and last_qty > 0 and avg_price > 0:
-            engine.handle_ws_fill(
-                order_id=int(order.get("i")),
-                side=str(order.get("S")),
-                price=avg_price,
-                quantity=last_qty,
-                event_time=event_time, # 传进去
-            )
+            if is_opening_order:
+                engine.handle_ws_fill(
+                    order_id=order_id,
+                    side=str(order.get("S")),
+                    price=avg_price,
+                    quantity=last_qty,
+                    event_time=event_time, # 传进去
+                )
     else:
         logger.debug("用户数据流事件=%s payload=%s", event_type, payload)
 
