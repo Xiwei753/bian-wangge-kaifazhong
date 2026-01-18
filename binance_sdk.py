@@ -234,7 +234,10 @@ def get_account_information(client: UMFutures) -> Dict[str, Any]:
 
 
 def get_position_risk(client: UMFutures, symbol: Optional[str] = None) -> Dict[str, Any]:
-    return _call(client.position_risk, symbol=symbol)
+    # ▼▼▼▼▼▼▼▼▼ 核心修复 ▼▼▼▼▼▼▼▼▼
+    # 官方库的方法名是 get_position_risk
+    return _call(client.get_position_risk, symbol=symbol)
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 
 def get_position_mode(client: UMFutures) -> Dict[str, Any]:
@@ -386,11 +389,8 @@ def get_order(
     if orig_client_order_id is not None:
         params["origClientOrderId"] = orig_client_order_id
     
-    # ▼▼▼▼▼▼ 核心修改：这里必须用 query_order ▼▼▼▼▼▼
     # 官方库 (binance-connector) 对应的方法名是 query_order
-    # 而非第三方库 (python-binance) 的 get_order
     return _call(client.query_order, **params)
-    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 
 def get_all_orders(
