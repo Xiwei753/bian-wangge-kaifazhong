@@ -137,8 +137,8 @@ class GridConfig:
         self.base_url_live: str = "https://fapi.binance.com"
         self.recv_window: int = 5000
         self.request_timeout: int = 10
-        self.api_key_test: Optional[str] = None
-        self.api_secret_test: Optional[str] = None
+        self.api_key_test: Optional[str] = "GpTMMRi3M92kZGFUErS7UfS2vl0TaBzgNtb1lWIhjIwaIsGcd4PrAcu3eRTsmcdJ"
+        self.api_secret_test: Optional[str] = "fpPn45zFzRoBxKBpcJiQjkjkrzhQVKTwFOlX9RpE38J1OSf9z0XsM9cuwGHBMWGr"
         self.api_key_live: Optional[str] = None
         self.api_secret_live: Optional[str] = None
 
