@@ -10,6 +10,8 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import importlib.util
+import queue
+import random
 import threading
 import time
 
@@ -34,6 +36,8 @@ sdk = _load_sdk_module()
 class GridOrderState:
     buy_order_id: Optional[int] = None
     sell_order_id: Optional[int] = None
+    buy_client_order_id: Optional[str] = None
+    sell_client_order_id: Optional[str] = None
     last_center_price: Optional[float] = None
     last_entry_price: Dict[str, Optional[float]] = field(
         default_factory=lambda: {"BUY": None, "SELL": None}
@@ -42,6 +46,9 @@ class GridOrderState:
         default_factory=lambda: {"BUY": None, "SELL": None}
     )
     tp_order_id: Dict[str, Optional[int]] = field(
+        default_factory=lambda: {"BUY": None, "SELL": None}
+    )
+    tp_client_order_id: Dict[str, Optional[str]] = field(
         default_factory=lambda: {"BUY": None, "SELL": None}
     )
 
@@ -59,6 +66,100 @@ class GridEngine:
         self.state = GridOrderState()
         self.tp_registry = TakeProfitRegistry()
         self.stop_event = threading.Event()
+        self.trade_queue: queue.Queue[TradeTask] = queue.Queue()
+
+    def _build_client_order_id(self, task: "TradeTask", action: str) -> str:
+        base = f"g{task.task_type[:2]}{task.order_id}{action}"
+        return base[:32]
+
+    def _get_current_price_with_retry(self, task: "TradeTask") -> Optional[float]:
+        result = self._rest_call_with_retry(
+            task,
+            "get_ticker_price",
+            sdk.get_ticker_price,
+            client=self.client,
+            symbol=self.config.symbol,
+        )
+        if not result or not result.get("ok"):
+            self.logger.warning("获取价格失败: %s", result)
+            return None
+        return float(result["data"]["price"])
+
+    def _is_duplicate_client_order_error(self, error: Optional[str]) -> bool:
+        if not error:
+            return False
+        normalized = error.lower()
+        return "duplicate" in normalized and "client" in normalized
+
+    def _rest_call_with_retry(
+        self,
+        task: "TradeTask",
+        action: str,
+        api_func,
+        client_order_id: Optional[str] = None,
+        allow_duplicate_check: bool = True,
+        **kwargs,
+    ) -> Optional[Dict[str, object]]:
+        max_attempts = 5
+        base_delay = 0.5
+        last_error = None
+        last_client_order_id = client_order_id
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = api_func(**kwargs)
+            except Exception as exc:
+                last_error = str(exc)
+                result = None
+            if result is None:
+                retryable = True
+            else:
+                if isinstance(result.get("data"), dict):
+                    last_client_order_id = (
+                        result["data"].get("clientOrderId") or last_client_order_id
+                    )
+                if result.get("ok"):
+                    return result
+                last_error = result.get("error")
+                if (
+                    allow_duplicate_check
+                    and client_order_id
+                    and self._is_duplicate_client_order_error(last_error)
+                ):
+                    lookup = self._rest_call_with_retry(
+                        task,
+                        "get_order",
+                        sdk.get_order,
+                        client_order_id=client_order_id,
+                        allow_duplicate_check=False,
+                        client=self.client,
+                        symbol=self.config.symbol,
+                        orig_client_order_id=client_order_id,
+                    )
+                    if lookup and lookup.get("ok"):
+                        return lookup
+                    return lookup or result
+
+                retryable = bool(result.get("retryable"))
+
+            if not retryable:
+                return result
+
+            if attempt < max_attempts:
+                jitter = random.uniform(0, 0.2)
+                delay = base_delay * (2 ** (attempt - 1)) + jitter
+                time.sleep(delay)
+            else:
+                self.logger.error(
+                    "REST任务重试失败 task_type=%s order_id=%s client_order_id=%s action=%s error=%s",
+                    task.task_type,
+                    task.order_id,
+                    last_client_order_id,
+                    action,
+                    last_error,
+                )
+                return result
+
+        return None
 
     def _round_price(self, value: float) -> float:
         return round(value, 1)
@@ -98,54 +199,136 @@ class GridEngine:
             else:
                 return None, default_sell_step
 
-    def _place_opening_orders(self, center_price: float) -> None:
+    def _place_opening_order_side(
+        self, center_price: float, side: str, task: "TradeTask"
+    ) -> Optional[int]:
+        step = center_price * self._get_open_step_ratio(side)
+        order_size = self._round_quantity(self.config.fixed_order_size)
+        self.state.last_center_price = self._round_price(center_price)
+        if side == "BUY":
+            price = center_price - step
+            position_side = "LONG"
+            action = "ob"
+            client_order_id = self._build_client_order_id(task, action)
+            result = self._rest_call_with_retry(
+                task,
+                "new_order_buy",
+                sdk.new_order,
+                client_order_id=client_order_id,
+                client=self.client,
+                symbol=self.config.symbol,
+                side="BUY",
+                order_type="LIMIT",
+                quantity=order_size,
+                price=self._round_price(price),
+                time_in_force="GTC",
+                position_side=position_side,
+                client_order_id=client_order_id,
+            )
+            if result and result.get("ok"):
+                self.state.buy_order_id = int(result["data"]["orderId"])
+                self.state.buy_client_order_id = client_order_id
+                self.logger.info("挂买单成功: 价格 %s", self._round_price(price))
+                return self.state.buy_order_id
+            self.logger.error("挂买单失败: %s", result)
+            return None
+        price = center_price + step
+        position_side = "SHORT"
+        action = "os"
+        client_order_id = self._build_client_order_id(task, action)
+        result = self._rest_call_with_retry(
+            task,
+            "new_order_sell",
+            sdk.new_order,
+            client_order_id=client_order_id,
+            client=self.client,
+            symbol=self.config.symbol,
+            side="SELL",
+            order_type="LIMIT",
+            quantity=order_size,
+            price=self._round_price(price),
+            time_in_force="GTC",
+            position_side=position_side,
+            client_order_id=client_order_id,
+        )
+        if result and result.get("ok"):
+            self.state.sell_order_id = int(result["data"]["orderId"])
+            self.state.sell_client_order_id = client_order_id
+            self.logger.info("挂卖单成功: 价格 %s", self._round_price(price))
+            return self.state.sell_order_id
+        self.logger.error("挂卖单失败: %s", result)
+        return None
+
+    def _place_opening_orders(self, center_price: float, task: "TradeTask") -> None:
         buy_step, sell_step = self._decide_grid_steps(center_price)
         order_size = self._round_quantity(self.config.fixed_order_size)
         self.state.last_center_price = self._round_price(center_price)
         
         if buy_step is not None:
             buy_price = center_price - buy_step
-            buy = sdk.new_order(
-                self.client,
+            buy_client_order_id = self._build_client_order_id(task, "ob")
+            buy = self._rest_call_with_retry(
+                task,
+                "new_order_buy",
+                sdk.new_order,
+                client_order_id=buy_client_order_id,
+                client=self.client,
                 symbol=self.config.symbol,
                 side="BUY",
                 order_type="LIMIT",
                 quantity=order_size,
                 price=self._round_price(buy_price),
                 time_in_force="GTC",
-                position_side="LONG"
+                position_side="LONG",
+                client_order_id=buy_client_order_id,
             )
-            if buy["ok"]:
+            if buy and buy.get("ok"):
                 self.state.buy_order_id = int(buy["data"]["orderId"])
+                self.state.buy_client_order_id = buy_client_order_id
                 self.logger.info(f"挂买单成功: 价格 {self._round_price(buy_price)}")
             else:
                 self.logger.error(f"挂买单失败: {buy}")
         else:
             self.state.buy_order_id = None
+            self.state.buy_client_order_id = None
 
         if sell_step is not None:
             sell_price = center_price + sell_step
-            sell = sdk.new_order(
-                self.client,
+            sell_client_order_id = self._build_client_order_id(task, "os")
+            sell = self._rest_call_with_retry(
+                task,
+                "new_order_sell",
+                sdk.new_order,
+                client_order_id=sell_client_order_id,
+                client=self.client,
                 symbol=self.config.symbol,
                 side="SELL",
                 order_type="LIMIT",
                 quantity=order_size,
                 price=self._round_price(sell_price),
                 time_in_force="GTC",
-                position_side="SHORT"
+                position_side="SHORT",
+                client_order_id=sell_client_order_id,
             )
-            if sell["ok"]:
+            if sell and sell.get("ok"):
                 self.state.sell_order_id = int(sell["data"]["orderId"])
+                self.state.sell_client_order_id = sell_client_order_id
                 self.logger.info(f"挂卖单成功: 价格 {self._round_price(sell_price)}")
             else:
                 self.logger.error(f"挂卖单失败: {sell}")
         else:
             self.state.sell_order_id = None
+            self.state.sell_client_order_id = None
 
-    def _get_position_amount(self, position_side: str) -> float:
-        res = sdk.get_position_risk(self.client, symbol=self.config.symbol)
-        if not res["ok"]:
+    def _get_position_amount(self, position_side: str, task: "TradeTask") -> float:
+        res = self._rest_call_with_retry(
+            task,
+            "get_position_risk",
+            sdk.get_position_risk,
+            client=self.client,
+            symbol=self.config.symbol,
+        )
+        if not res or not res.get("ok"):
             self.logger.warning(f"查询持仓失败: {res}")
             return 0.0
         
@@ -154,7 +337,9 @@ class GridEngine:
                 return abs(float(pos["positionAmt"]))
         return 0.0
 
-    def _place_take_profit(self, side: str, entry_price: float, quantity: float) -> Optional[int]:
+    def _place_take_profit(
+        self, side: str, entry_price: float, quantity: float, task: "TradeTask"
+    ) -> Optional[int]:
         step = entry_price * self._get_take_profit_step_ratio(side)
         
         if side == "BUY":
@@ -166,7 +351,7 @@ class GridEngine:
             tp_side = "BUY"
             pos_side = "SHORT"
             
-        real_position = self._get_position_amount(pos_side)
+        real_position = self._get_position_amount(pos_side, task)
         if real_position == 0:
             self.logger.warning(f"【严重警告】试图挂止盈单，但真实持仓为0！已取消下单。PosSide={pos_side}")
             self.state.last_entry_price[side] = None
@@ -178,20 +363,29 @@ class GridEngine:
         order_size = self._round_quantity(actual_qty)
         tp_price = self._round_price(tp_price)
         
-        result = sdk.new_order(
-            self.client,
+        tp_action = "tpb" if side == "BUY" else "tps"
+        tp_client_order_id = self._build_client_order_id(task, tp_action)
+        result = self._rest_call_with_retry(
+            task,
+            "new_order_take_profit",
+            sdk.new_order,
+            client_order_id=tp_client_order_id,
+            client=self.client,
             symbol=self.config.symbol,
             side=tp_side,
             order_type="LIMIT",
             quantity=order_size,
             price=tp_price,
             time_in_force="GTC",
-            position_side=pos_side
+            position_side=pos_side,
+            client_order_id=tp_client_order_id,
         )
         
-        if not result["ok"]:
-            raise RuntimeError(f"止盈单下单失败: {result}")
+        if not result or not result.get("ok"):
+            self.logger.error("止盈单下单失败: %s", result)
+            return None
         order_id = int(result["data"]["orderId"])
+        self.state.tp_client_order_id[side] = tp_client_order_id
         self.tp_registry.add_record(
             order_id=order_id,
             price=tp_price,
@@ -218,16 +412,200 @@ class GridEngine:
             self.logger.warning(f"设置持仓模式异常 (如果是 'No need to change' 可忽略): {e}")
 
         center_price = self._get_current_price()
-        self._place_opening_orders(center_price)
+        init_task = TradeTask(
+            order_id=0,
+            side="INIT",
+            price=center_price,
+            quantity=0,
+            task_type="init",
+        )
+        self._place_opening_orders(center_price, init_task)
 
-    def _cancel_opposite(self, order_id: Optional[int]) -> None:
-        if order_id is None:
+    def _cancel_opposite(
+        self, order_id: Optional[int], client_order_id: Optional[str], task: "TradeTask"
+    ) -> None:
+        if order_id is None and client_order_id is None:
             return
-        result = sdk.cancel_order(self.client, symbol=self.config.symbol, order_id=order_id)
-        if not result["ok"]:
+        result = self._rest_call_with_retry(
+            task,
+            "cancel_order",
+            sdk.cancel_order,
+            client=self.client,
+            symbol=self.config.symbol,
+            order_id=order_id,
+            orig_client_order_id=client_order_id,
+        )
+        if not result or not result.get("ok"):
             self.logger.warning("撤单失败 order_id=%s result=%s", order_id, result)
             return
         self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
+
+    def _cancel_exchange_order(self, order: Dict[str, object], task: "TradeTask") -> None:
+        order_id = int(order.get("orderId") or 0)
+        client_order_id = order.get("clientOrderId")
+        result = self._rest_call_with_retry(
+            task,
+            "cancel_order",
+            sdk.cancel_order,
+            client=self.client,
+            symbol=self.config.symbol,
+            order_id=order_id or None,
+            orig_client_order_id=client_order_id,
+        )
+        if not result or not result.get("ok"):
+            self.logger.warning("撤单失败 order_id=%s result=%s", order_id, result)
+            return
+        self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
+
+    def reconcile_state(self, task: "TradeTask") -> None:
+        logger = logging.getLogger("Reconcile")
+        prev_buy_id = self.state.buy_order_id
+        prev_sell_id = self.state.sell_order_id
+        prev_tp_records = self.tp_registry.list_records()
+        prev_tp_ids = {record.order_id for record in prev_tp_records}
+
+        open_orders = self._rest_call_with_retry(
+            task,
+            "reconcile_open_orders",
+            sdk.get_open_orders,
+            client=self.client,
+            symbol=self.config.symbol,
+        )
+        if not open_orders or not open_orders.get("ok"):
+            logger.warning("对账查询 openOrders 失败: %s", open_orders)
+            return
+        _ = self._rest_call_with_retry(
+            task,
+            "reconcile_position",
+            sdk.get_position_risk,
+            client=self.client,
+            symbol=self.config.symbol,
+        )
+
+        categories = {
+            "open_buy": [],
+            "open_sell": [],
+            "tp_buy": [],
+            "tp_sell": [],
+            "other": [],
+        }
+        for order in open_orders.get("data", []):
+            if order.get("symbol") != self.config.symbol:
+                continue
+            side = order.get("side")
+            position_side = order.get("positionSide")
+            if position_side == "LONG" and side == "BUY":
+                categories["open_buy"].append(order)
+            elif position_side == "SHORT" and side == "SELL":
+                categories["open_sell"].append(order)
+            elif position_side == "LONG" and side == "SELL":
+                categories["tp_buy"].append(order)
+            elif position_side == "SHORT" and side == "BUY":
+                categories["tp_sell"].append(order)
+            else:
+                categories["other"].append(order)
+
+        for name, orders in categories.items():
+            if len(orders) <= 1:
+                continue
+            orders_sorted = sorted(orders, key=lambda item: int(item.get("orderId") or 0))
+            for extra in orders_sorted[1:]:
+                logger.warning("对账发现多余挂单 category=%s order=%s", name, extra)
+                self._cancel_exchange_order(extra, task)
+            categories[name] = orders_sorted[:1]
+
+        exchange_buy = categories["open_buy"][0] if categories["open_buy"] else None
+        exchange_sell = categories["open_sell"][0] if categories["open_sell"] else None
+
+        self.state.buy_order_id = (
+            int(exchange_buy.get("orderId")) if exchange_buy else None
+        )
+        self.state.buy_client_order_id = (
+            exchange_buy.get("clientOrderId") if exchange_buy else None
+        )
+        self.state.sell_order_id = (
+            int(exchange_sell.get("orderId")) if exchange_sell else None
+        )
+        self.state.sell_client_order_id = (
+            exchange_sell.get("clientOrderId") if exchange_sell else None
+        )
+
+        if prev_buy_id is None and exchange_buy:
+            logger.warning("对账发现多余买单，准备撤单: %s", exchange_buy)
+            self._cancel_exchange_order(exchange_buy, task)
+            self.state.buy_order_id = None
+            self.state.buy_client_order_id = None
+        elif prev_buy_id is not None and exchange_buy is None:
+            center_price = self.state.last_center_price or self._get_current_price_with_retry(task)
+            if center_price is not None:
+                logger.warning("对账发现缺失买单，准备补挂")
+                self._place_opening_order_side(center_price, "BUY", task)
+
+        if prev_sell_id is None and exchange_sell:
+            logger.warning("对账发现多余卖单，准备撤单: %s", exchange_sell)
+            self._cancel_exchange_order(exchange_sell, task)
+            self.state.sell_order_id = None
+            self.state.sell_client_order_id = None
+        elif prev_sell_id is not None and exchange_sell is None:
+            center_price = self.state.last_center_price or self._get_current_price_with_retry(task)
+            if center_price is not None:
+                logger.warning("对账发现缺失卖单，准备补挂")
+                self._place_opening_order_side(center_price, "SELL", task)
+
+        exchange_tp_orders = {
+            int(order.get("orderId") or 0): order
+            for order in categories["tp_buy"] + categories["tp_sell"]
+        }
+        for order in list(exchange_tp_orders.values()):
+            if not self.tp_registry.has_record(int(order.get("orderId") or 0)):
+                logger.warning("对账发现多余止盈单，准备撤单: %s", order)
+                self._cancel_exchange_order(order, task)
+                exchange_tp_orders.pop(int(order.get("orderId") or 0), None)
+
+        for record in prev_tp_records:
+            if record.order_id in exchange_tp_orders:
+                continue
+            entry_price = self.state.last_entry_price.get(record.entry_side)
+            entry_qty = self.state.last_entry_quantity.get(record.entry_side)
+            if entry_price and entry_qty:
+                logger.warning(
+                    "对账发现缺失止盈单，准备补挂 entry_side=%s order_id=%s",
+                    record.entry_side,
+                    record.order_id,
+                )
+                self.tp_registry.remove_record(record.order_id)
+                self._place_take_profit(
+                    side=record.entry_side,
+                    entry_price=entry_price,
+                    quantity=entry_qty,
+                    task=task,
+                )
+            else:
+                logger.warning(
+                    "对账发现缺失止盈单但缺少本地成交信息 order_id=%s entry_side=%s",
+                    record.order_id,
+                    record.entry_side,
+                )
+                self.tp_registry.remove_record(record.order_id)
+
+        for order in exchange_tp_orders.values():
+            order_id = int(order.get("orderId") or 0)
+            if order_id == 0:
+                continue
+            if order_id in prev_tp_ids:
+                continue
+            entry_side = "BUY" if order.get("positionSide") == "LONG" else "SELL"
+            tp_side = str(order.get("side"))
+            price = float(order.get("price") or 0)
+            if price <= 0:
+                continue
+            self.tp_registry.add_record(
+                order_id=order_id,
+                price=price,
+                entry_side=entry_side,
+                tp_side=tp_side,
+            )
+            self.state.tp_client_order_id[entry_side] = order.get("clientOrderId")
 
     def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
         if quantity <= 0:
@@ -240,21 +618,31 @@ class GridEngine:
             price,
             quantity,
         )
-        self.state.last_entry_price[side] = price
-        self.state.last_entry_quantity[side] = quantity
-        if side == "BUY":
+        self.trade_queue.put(
+            TradeTask(order_id=order_id, side=side, price=price, quantity=quantity)
+        )
+
+    def process_trade_task(self, task: "TradeTask") -> None:
+        self.state.last_entry_price[task.side] = task.price
+        self.state.last_entry_quantity[task.side] = task.quantity
+        if task.side == "BUY":
             self.state.buy_order_id = None
+            self.state.buy_client_order_id = None
         else:
             self.state.sell_order_id = None
-        if side == "BUY":
-            self._cancel_opposite(self.state.sell_order_id)
+            self.state.sell_client_order_id = None
+        if task.side == "BUY":
+            self._cancel_opposite(
+                self.state.sell_order_id, self.state.sell_client_order_id, task
+            )
         else:
-            self._cancel_opposite(self.state.buy_order_id)
-        self._place_opening_orders(price)
+            self._cancel_opposite(
+                self.state.buy_order_id, self.state.buy_client_order_id, task
+            )
+        self._place_opening_orders(task.price, task)
 
-        # WS 负责下单/撤单/止盈
-        self.state.tp_order_id[side] = self._place_take_profit(
-            side=side, entry_price=price, quantity=quantity
+        self.state.tp_order_id[task.side] = self._place_take_profit(
+            side=task.side, entry_price=task.price, quantity=task.quantity, task=task
         )
 
 
@@ -266,7 +654,10 @@ def _run_depth_ws(config: GridConfig, stop_event: threading.Event) -> None:
     logger = logging.getLogger("DepthWS")
 
     def on_message(_: sdk.websocket.WebSocketApp, message: str) -> None:
-        logger.debug("收到盘口消息长度=%s", len(message))
+        try:
+            logger.debug("收到盘口消息长度=%s", len(message))
+        except Exception:
+            logger.exception("处理盘口 WS 消息异常")
 
     def on_error(_: sdk.websocket.WebSocketApp, error: Exception) -> None:
         logger.error("盘口 WS 错误: %s", error)
@@ -346,7 +737,10 @@ def _run_user_data_ws(
     logger = logging.getLogger("UserDataWS")
 
     def on_message(_: sdk.websocket.WebSocketApp, message: str) -> None:
-        _handle_user_data_message(engine, logger, message)
+        try:
+            _handle_user_data_message(engine, logger, message)
+        except Exception:
+            logger.exception("处理用户数据 WS 消息异常")
 
     def on_error(_: sdk.websocket.WebSocketApp, error: Exception) -> None:
         logger.error("用户数据 WS 错误: %s", error)
@@ -356,6 +750,15 @@ def _run_user_data_ws(
 
     def on_open(_: sdk.websocket.WebSocketApp) -> None:
         logger.info("用户数据 WS 已连接")
+        engine.trade_queue.put(
+            TradeTask(
+                order_id=int(time.time() * 1000),
+                side="RECON",
+                price=0,
+                quantity=0,
+                task_type="reconcile",
+            )
+        )
 
     while not stop_event.is_set():
         listen_key_result = sdk.new_listen_key(engine.client)
@@ -369,6 +772,22 @@ def _run_user_data_ws(
             time.sleep(5)
             continue
             
+        reconnect_event = threading.Event()
+
+        def _keepalive_loop() -> None:
+            while not stop_event.is_set() and not reconnect_event.is_set():
+                if reconnect_event.wait(timeout=1800):
+                    break
+                result = sdk.renew_listen_key(engine.client, listen_key)
+                if not result.get("ok"):
+                    logger.error("listenKey 续期失败，准备重连: %s", result)
+                    reconnect_event.set()
+                    try:
+                        ws_app.close()
+                    except Exception:
+                        logger.exception("关闭用户数据 WS 异常")
+                    break
+
         ws_app = sdk.subscribe_user_data_ws(
             listen_key=listen_key,
             on_message=on_message,
@@ -377,7 +796,15 @@ def _run_user_data_ws(
             on_close=on_close,
             on_open=on_open,
         )
+        keepalive_thread = threading.Thread(
+            target=_keepalive_loop,
+            name="UserDataWSKeepalive",
+            daemon=True,
+        )
+        keepalive_thread.start()
         ws_app.run_forever(ping_interval=20, ping_timeout=10)
+        reconnect_event.set()
+        keepalive_thread.join(timeout=2)
 
         if stop_event.is_set():
             break
@@ -386,6 +813,33 @@ def _run_user_data_ws(
 
     if "listen_key" in locals():
         sdk.close_listen_key(engine.client, listen_key)
+
+
+@dataclass(frozen=True)
+class TradeTask:
+    order_id: int
+    side: str
+    price: float
+    quantity: float
+    task_type: str = "ws_fill"
+
+
+def _trade_worker(engine: GridEngine, stop_event: threading.Event) -> None:
+    logger = logging.getLogger("TradeWorker")
+    while not stop_event.is_set() or not engine.trade_queue.empty():
+        try:
+            task = engine.trade_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            if task.task_type == "reconcile":
+                engine.reconcile_state(task)
+            else:
+                engine.process_trade_task(task)
+        except Exception:
+            logger.exception("处理交易任务失败 task=%s", task)
+        finally:
+            engine.trade_queue.task_done()
 
 
 def run_grid_loop() -> None:
@@ -404,8 +858,15 @@ def run_grid_loop() -> None:
         name="UserDataWS",
         daemon=True,
     )
+    trade_thread = threading.Thread(
+        target=_trade_worker,
+        args=(engine, engine.stop_event),
+        name="TradeWorker",
+        daemon=True,
+    )
     depth_thread.start()
     user_data_thread.start()
+    trade_thread.start()
     engine.stop_event.wait()
 
 
