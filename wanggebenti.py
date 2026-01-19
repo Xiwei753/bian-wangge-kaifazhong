@@ -103,6 +103,8 @@ class GridEngine:
         max_attempts = 5
         base_delay = 0.5
         last_error = None
+        if client_order_id is None:
+            client_order_id = kwargs.get("client_order_id")
         last_client_order_id = client_order_id
         for attempt in range(1, max_attempts + 1):
             try:
@@ -214,7 +216,6 @@ class GridEngine:
                 task,
                 "new_order_buy",
                 sdk.new_order,
-                client_order_id=client_order_id,
                 client=self.client,
                 symbol=self.config.symbol,
                 side="BUY",
@@ -240,7 +241,6 @@ class GridEngine:
             task,
             "new_order_sell",
             sdk.new_order,
-            client_order_id=client_order_id,
             client=self.client,
             symbol=self.config.symbol,
             side="SELL",
@@ -271,7 +271,6 @@ class GridEngine:
                 task,
                 "new_order_buy",
                 sdk.new_order,
-                client_order_id=buy_client_order_id,
                 client=self.client,
                 symbol=self.config.symbol,
                 side="BUY",
@@ -299,7 +298,6 @@ class GridEngine:
                 task,
                 "new_order_sell",
                 sdk.new_order,
-                client_order_id=sell_client_order_id,
                 client=self.client,
                 symbol=self.config.symbol,
                 side="SELL",
@@ -369,7 +367,6 @@ class GridEngine:
             task,
             "new_order_take_profit",
             sdk.new_order,
-            client_order_id=tp_client_order_id,
             client=self.client,
             symbol=self.config.symbol,
             side=tp_side,
