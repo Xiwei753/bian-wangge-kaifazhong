@@ -626,19 +626,19 @@ class GridEngine:
         self.state.last_entry_price[task.side] = task.price
         self.state.last_entry_quantity[task.side] = task.quantity
         if task.side == "BUY":
+            opposite_order_id = self.state.sell_order_id
+            opposite_client_order_id = self.state.sell_client_order_id
             self.state.buy_order_id = None
             self.state.buy_client_order_id = None
         else:
+            opposite_order_id = self.state.buy_order_id
+            opposite_client_order_id = self.state.buy_client_order_id
             self.state.sell_order_id = None
             self.state.sell_client_order_id = None
         if task.side == "BUY":
-            self._cancel_opposite(
-                self.state.sell_order_id, self.state.sell_client_order_id, task
-            )
+            self._cancel_opposite(opposite_order_id, opposite_client_order_id, task)
         else:
-            self._cancel_opposite(
-                self.state.buy_order_id, self.state.buy_client_order_id, task
-            )
+            self._cancel_opposite(opposite_order_id, opposite_client_order_id, task)
         self._place_opening_orders(task.price, task)
 
         self.state.tp_order_id[task.side] = self._place_take_profit(
