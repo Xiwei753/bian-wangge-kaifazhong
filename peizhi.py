@@ -30,12 +30,10 @@ class GridConfig:
         self.enable_short: bool = True
         self.enable_flexible_tp: bool = True
         self.enable_profit_stop_for_trapped: bool = True
-        self.enable_polling_after_ws_fill: bool = True
 
         # ===================== 网格基础参数 =====================
         self.grid_count: int = 3
         self.fixed_order_size: float = 0.01
-        self.check_interval: float = 2.0
         self.position_report_interval: int = 180
         
         # ===================== 动态网格管理配置 =====================
