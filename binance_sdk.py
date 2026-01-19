@@ -7,9 +7,11 @@
 #都写到这里。peizhi里面就只写其他的参数
 
 from typing import Any, Callable, Dict, List, Optional
+
+import requests
+import websocket
 from binance.error import ClientError
 from binance.um_futures import UMFutures
-import websocket
 
 
 def _call(api_func, *args, **kwargs) -> Dict[str, Any]:
@@ -18,11 +20,28 @@ def _call(api_func, *args, **kwargs) -> Dict[str, Any]:
         data = api_func(*args, **kwargs)
         return {"ok": True, "data": data}
     except ClientError as exc:
+        status_code = exc.status_code
+        retryable = status_code in (418, 429) or 500 <= status_code < 600
         return {
             "ok": False,
-            "status_code": exc.status_code,
+            "status_code": status_code,
             "error": exc.error_message,
             "data": getattr(exc, "error_data", None),
+            "retryable": retryable,
+        }
+    except requests.exceptions.RequestException as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "data": None,
+            "retryable": True,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "data": None,
+            "retryable": True,
         }
 
 
