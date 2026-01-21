@@ -16,7 +16,7 @@ import threading
 import time
 
 from peizhi import GridConfig
-from zhiyingguanli import TakeProfitRegistry
+from zhiyingguanli import LifecycleManager
 
 
 def _load_sdk_module():
@@ -64,7 +64,7 @@ class GridEngine:
             timeout=config.request_timeout,
         )
         self.state = GridOrderState()
-        self.tp_registry = TakeProfitRegistry()
+        self.lifecycle_manager = LifecycleManager()
         self.stop_event = threading.Event()
         self.trade_queue: queue.Queue[TradeTask] = queue.Queue()
 
@@ -106,6 +106,8 @@ class GridEngine:
         last_client_order_id = client_order_id
         for attempt in range(1, max_attempts + 1):
             try:
+                if client_order_id and "client_order_id" not in kwargs:
+                    kwargs["client_order_id"] = client_order_id
                 result = api_func(**kwargs)
             except Exception as exc:
                 last_error = str(exc)
@@ -223,7 +225,6 @@ class GridEngine:
                 price=self._round_price(price),
                 time_in_force="GTC",
                 position_side=position_side,
-                client_order_id=client_order_id,
             )
             if result and result.get("ok"):
                 self.state.buy_order_id = int(result["data"]["orderId"])
@@ -249,7 +250,6 @@ class GridEngine:
             price=self._round_price(price),
             time_in_force="GTC",
             position_side=position_side,
-            client_order_id=client_order_id,
         )
         if result and result.get("ok"):
             self.state.sell_order_id = int(result["data"]["orderId"])
@@ -280,11 +280,16 @@ class GridEngine:
                 price=self._round_price(buy_price),
                 time_in_force="GTC",
                 position_side="LONG",
-                client_order_id=buy_client_order_id,
             )
             if buy and buy.get("ok"):
                 self.state.buy_order_id = int(buy["data"]["orderId"])
                 self.state.buy_client_order_id = buy_client_order_id
+                self.lifecycle_manager.add_grid(
+                    order_id=self.state.buy_order_id,
+                    price=self._round_price(buy_price),
+                    entry_side="BUY",
+                    status="NEW",
+                )
                 self.logger.info(f"挂买单成功: 价格 {self._round_price(buy_price)}")
             else:
                 self.logger.error(f"挂买单失败: {buy}")
@@ -308,11 +313,16 @@ class GridEngine:
                 price=self._round_price(sell_price),
                 time_in_force="GTC",
                 position_side="SHORT",
-                client_order_id=sell_client_order_id,
             )
             if sell and sell.get("ok"):
                 self.state.sell_order_id = int(sell["data"]["orderId"])
                 self.state.sell_client_order_id = sell_client_order_id
+                self.lifecycle_manager.add_grid(
+                    order_id=self.state.sell_order_id,
+                    price=self._round_price(sell_price),
+                    entry_side="SELL",
+                    status="NEW",
+                )
                 self.logger.info(f"挂卖单成功: 价格 {self._round_price(sell_price)}")
             else:
                 self.logger.error(f"挂卖单失败: {sell}")
@@ -338,7 +348,12 @@ class GridEngine:
         return 0.0
 
     def _place_take_profit(
-        self, side: str, entry_price: float, quantity: float, task: "TradeTask"
+        self,
+        side: str,
+        entry_price: float,
+        quantity: float,
+        task: "TradeTask",
+        parent_id: Optional[int] = None,
     ) -> Optional[int]:
         step = entry_price * self._get_take_profit_step_ratio(side)
         
@@ -378,17 +393,18 @@ class GridEngine:
             price=tp_price,
             time_in_force="GTC",
             position_side=pos_side,
-            client_order_id=tp_client_order_id,
         )
         
         if not result or not result.get("ok"):
             self.logger.error("止盈单下单失败: %s", result)
             return None
         order_id = int(result["data"]["orderId"])
+        record_parent_id = parent_id if parent_id is not None else task.order_id
         self.state.tp_client_order_id[side] = tp_client_order_id
-        self.tp_registry.add_record(
+        self.lifecycle_manager.add_tp(
             order_id=order_id,
             price=tp_price,
+            parent_id=record_parent_id,
             entry_side=side,
             tp_side=tp_side,
         )
@@ -461,7 +477,7 @@ class GridEngine:
         logger = logging.getLogger("Reconcile")
         prev_buy_id = self.state.buy_order_id
         prev_sell_id = self.state.sell_order_id
-        prev_tp_records = self.tp_registry.list_records()
+        prev_tp_records = self.lifecycle_manager.list_tp_records(status="NEW")
         prev_tp_ids = {record.order_id for record in prev_tp_records}
 
         open_orders = self._rest_call_with_retry(
@@ -556,37 +572,28 @@ class GridEngine:
             int(order.get("orderId") or 0): order
             for order in categories["tp_buy"] + categories["tp_sell"]
         }
-        for order in list(exchange_tp_orders.values()):
-            if not self.tp_registry.has_record(int(order.get("orderId") or 0)):
-                logger.warning("对账发现多余止盈单，准备撤单: %s", order)
-                self._cancel_exchange_order(order, task)
-                exchange_tp_orders.pop(int(order.get("orderId") or 0), None)
-
         for record in prev_tp_records:
             if record.order_id in exchange_tp_orders:
                 continue
-            entry_price = self.state.last_entry_price.get(record.entry_side)
-            entry_qty = self.state.last_entry_quantity.get(record.entry_side)
-            if entry_price and entry_qty:
+            entry_side = record.entry_side
+            if not entry_side and record.parent_id:
+                parent_record = self.lifecycle_manager.get_record(record.parent_id)
+                entry_side = parent_record.entry_side if parent_record else None
+            entry_price = self.state.last_entry_price.get(entry_side) if entry_side else None
+            entry_qty = self.state.last_entry_quantity.get(entry_side) if entry_side else None
+            if entry_side and entry_price and entry_qty:
                 logger.warning(
-                    "对账发现缺失止盈单，准备补挂 entry_side=%s order_id=%s",
-                    record.entry_side,
+                    "对账发现缺失止盈单，仅记录状态 entry_side=%s order_id=%s",
+                    entry_side,
                     record.order_id,
-                )
-                self.tp_registry.remove_record(record.order_id)
-                self._place_take_profit(
-                    side=record.entry_side,
-                    entry_price=entry_price,
-                    quantity=entry_qty,
-                    task=task,
                 )
             else:
                 logger.warning(
                     "对账发现缺失止盈单但缺少本地成交信息 order_id=%s entry_side=%s",
                     record.order_id,
-                    record.entry_side,
+                    entry_side,
                 )
-                self.tp_registry.remove_record(record.order_id)
+            self.lifecycle_manager.update_status(record.order_id, "FILLED")
 
         for order in exchange_tp_orders.values():
             order_id = int(order.get("orderId") or 0)
@@ -599,9 +606,10 @@ class GridEngine:
             price = float(order.get("price") or 0)
             if price <= 0:
                 continue
-            self.tp_registry.add_record(
+            self.lifecycle_manager.add_tp(
                 order_id=order_id,
                 price=price,
+                parent_id=None,
                 entry_side=entry_side,
                 tp_side=tp_side,
             )
@@ -625,6 +633,7 @@ class GridEngine:
     def process_trade_task(self, task: "TradeTask") -> None:
         self.state.last_entry_price[task.side] = task.price
         self.state.last_entry_quantity[task.side] = task.quantity
+        self.lifecycle_manager.update_status(task.order_id, "FILLED")
         if task.side == "BUY":
             opposite_order_id = self.state.sell_order_id
             opposite_client_order_id = self.state.sell_client_order_id
@@ -714,9 +723,13 @@ def _handle_user_data_message(
             avg_price,
             last_qty,
         )
-        if order_id and engine.tp_registry.has_record(order_id):
+        if order_id and engine.lifecycle_manager.has_tp_record(order_id):
             if status in ["FILLED", "CANCELED", "EXPIRED", "REJECTED"]:
-                engine.tp_registry.remove_record(order_id)
+                tp_record = engine.lifecycle_manager.get_record(order_id)
+                parent_id = tp_record.parent_id if tp_record else None
+                engine.lifecycle_manager.remove_record(order_id)
+                if parent_id:
+                    engine.lifecycle_manager.remove_record(parent_id)
         is_opening_order = order_id in (engine.state.buy_order_id, engine.state.sell_order_id)
         if exec_type == "TRADE" and last_qty > 0 and avg_price > 0:
             if is_opening_order:
@@ -735,20 +748,43 @@ def _run_user_data_ws(
     stop_event: threading.Event,
 ) -> None:
     logger = logging.getLogger("UserDataWS")
+    backoff_delay = 5
+
+    def _is_connection_reset_error(error: Exception) -> bool:
+        if isinstance(error, ConnectionResetError):
+            return True
+        err_no = getattr(error, "errno", None)
+        if err_no == 10054:
+            return True
+        return "10054" in str(error)
+
+    def _sleep_with_backoff(reason: str) -> None:
+        nonlocal backoff_delay
+        logger.warning("%s，%s秒后重试", reason, backoff_delay)
+        time.sleep(backoff_delay)
+        backoff_delay = min(backoff_delay * 2, 60)
 
     def on_message(_: sdk.websocket.WebSocketApp, message: str) -> None:
         try:
             _handle_user_data_message(engine, logger, message)
-        except Exception:
+        except Exception as exc:
+            if _is_connection_reset_error(exc):
+                logger.warning("用户数据 WS 连接被重置: %s", exc)
+                return
             logger.exception("处理用户数据 WS 消息异常")
 
     def on_error(_: sdk.websocket.WebSocketApp, error: Exception) -> None:
+        if _is_connection_reset_error(error):
+            logger.warning("用户数据 WS 连接被重置: %s", error)
+            return
         logger.error("用户数据 WS 错误: %s", error)
 
     def on_close(_: sdk.websocket.WebSocketApp, status_code: int, msg: str) -> None:
         logger.warning("用户数据 WS 关闭 code=%s msg=%s", status_code, msg)
 
     def on_open(_: sdk.websocket.WebSocketApp) -> None:
+        nonlocal backoff_delay
+        backoff_delay = 5
         logger.info("用户数据 WS 已连接")
         engine.trade_queue.put(
             TradeTask(
@@ -763,13 +799,11 @@ def _run_user_data_ws(
     while not stop_event.is_set():
         listen_key_result = sdk.new_listen_key(engine.client)
         if not listen_key_result["ok"]:
-            logger.error("获取 listenKey 失败: %s", listen_key_result)
-            time.sleep(5)
+            _sleep_with_backoff(f"获取 listenKey 失败: {listen_key_result}")
             continue
         listen_key = listen_key_result["data"].get("listenKey")
         if not listen_key:
-            logger.error("listenKey 为空: %s", listen_key_result)
-            time.sleep(5)
+            _sleep_with_backoff(f"listenKey 为空: {listen_key_result}")
             continue
             
         reconnect_event = threading.Event()
@@ -808,8 +842,7 @@ def _run_user_data_ws(
 
         if stop_event.is_set():
             break
-        logger.warning("用户数据 WS 断开，5秒后重连")
-        time.sleep(5)
+        _sleep_with_backoff("用户数据 WS 断开")
 
     if "listen_key" in locals():
         sdk.close_listen_key(engine.client, listen_key)
