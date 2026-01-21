@@ -62,9 +62,16 @@ def create_um_client(
     api_secret: str,
     base_url: Optional[str] = None,
     timeout: int = 10,
+    **kwargs,
 ) -> UMFutures:
     """创建 USDT-M 合约客户端。"""
-    return UMFutures(key=api_key, secret=api_secret, base_url=base_url, timeout=timeout)
+    return UMFutures(
+        key=api_key,
+        secret=api_secret,
+        base_url=base_url,
+        timeout=timeout,
+        **kwargs,
+    )
 
 
 # ===================== 行情相关 =====================
