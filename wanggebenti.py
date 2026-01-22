@@ -330,23 +330,6 @@ class GridEngine:
             self.state.sell_order_id = None
             self.state.sell_client_order_id = None
 
-    def _get_position_amount(self, position_side: str, task: "TradeTask") -> float:
-        res = self._rest_call_with_retry(
-            task,
-            "get_position_risk",
-            sdk.get_position_risk,
-            client=self.client,
-            symbol=self.config.symbol,
-        )
-        if not res or not res.get("ok"):
-            self.logger.warning(f"查询持仓失败: {res}")
-            return 0.0
-        
-        for pos in res["data"]:
-            if pos["positionSide"] == position_side:
-                return abs(float(pos["positionAmt"]))
-        return 0.0
-
     def _place_take_profit(
         self,
         side: str,
@@ -366,16 +349,7 @@ class GridEngine:
             tp_side = "BUY"
             pos_side = "SHORT"
             
-        real_position = self._get_position_amount(pos_side, task)
-        if real_position == 0:
-            self.logger.warning(f"【严重警告】试图挂止盈单，但真实持仓为0！已取消下单。PosSide={pos_side}")
-            self.state.last_entry_price[side] = None
-            self.state.last_entry_quantity[side] = None
-            self.state.tp_order_id[side] = None
-            return None
-
-        actual_qty = min(quantity, real_position)
-        order_size = self._round_quantity(actual_qty)
+        order_size = self._round_quantity(quantity)
         tp_price = self._round_price(tp_price)
         
         tp_action = "tpb" if side == "BUY" else "tps"
