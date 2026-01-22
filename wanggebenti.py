@@ -430,165 +430,6 @@ class GridEngine:
             return
         self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
 
-    def _cancel_exchange_order(self, order: Dict[str, object], task: "TradeTask") -> None:
-        order_id = int(order.get("orderId") or 0)
-        client_order_id = order.get("clientOrderId")
-        result = self._rest_call_with_retry(
-            task,
-            "cancel_order",
-            sdk.cancel_order,
-            client=self.client,
-            symbol=self.config.symbol,
-            order_id=order_id or None,
-            orig_client_order_id=client_order_id,
-        )
-        if not result or not result.get("ok"):
-            self.logger.warning("撤单失败 order_id=%s result=%s", order_id, result)
-            return
-        self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
-
-    def reconcile_state(self, task: "TradeTask") -> None:
-        logger = logging.getLogger("Reconcile")
-        prev_buy_id = self.state.buy_order_id
-        prev_sell_id = self.state.sell_order_id
-        prev_tp_records = self.lifecycle_manager.list_tp_records(status="NEW")
-        prev_tp_ids = {record.order_id for record in prev_tp_records}
-
-        open_orders = self._rest_call_with_retry(
-            task,
-            "reconcile_open_orders",
-            sdk.get_open_orders,
-            client=self.client,
-            symbol=self.config.symbol,
-        )
-        if not open_orders or not open_orders.get("ok"):
-            logger.warning("对账查询 openOrders 失败: %s", open_orders)
-            return
-        _ = self._rest_call_with_retry(
-            task,
-            "reconcile_position",
-            sdk.get_position_risk,
-            client=self.client,
-            symbol=self.config.symbol,
-        )
-
-        categories = {
-            "open_buy": [],
-            "open_sell": [],
-            "tp_buy": [],
-            "tp_sell": [],
-            "other": [],
-        }
-        for order in open_orders.get("data", []):
-            if order.get("symbol") != self.config.symbol:
-                continue
-            side = order.get("side")
-            position_side = order.get("positionSide")
-            if position_side == "LONG" and side == "BUY":
-                categories["open_buy"].append(order)
-            elif position_side == "SHORT" and side == "SELL":
-                categories["open_sell"].append(order)
-            elif position_side == "LONG" and side == "SELL":
-                categories["tp_buy"].append(order)
-            elif position_side == "SHORT" and side == "BUY":
-                categories["tp_sell"].append(order)
-            else:
-                categories["other"].append(order)
-
-        for name, orders in categories.items():
-            if len(orders) <= 1:
-                continue
-            orders_sorted = sorted(orders, key=lambda item: int(item.get("orderId") or 0))
-            for extra in orders_sorted[1:]:
-                logger.warning("对账发现多余挂单 category=%s order=%s", name, extra)
-                self._cancel_exchange_order(extra, task)
-            categories[name] = orders_sorted[:1]
-
-        exchange_buy = categories["open_buy"][0] if categories["open_buy"] else None
-        exchange_sell = categories["open_sell"][0] if categories["open_sell"] else None
-
-        self.state.buy_order_id = (
-            int(exchange_buy.get("orderId")) if exchange_buy else None
-        )
-        self.state.buy_client_order_id = (
-            exchange_buy.get("clientOrderId") if exchange_buy else None
-        )
-        self.state.sell_order_id = (
-            int(exchange_sell.get("orderId")) if exchange_sell else None
-        )
-        self.state.sell_client_order_id = (
-            exchange_sell.get("clientOrderId") if exchange_sell else None
-        )
-
-        if prev_buy_id is None and exchange_buy:
-            logger.warning("对账发现多余买单，准备撤单: %s", exchange_buy)
-            self._cancel_exchange_order(exchange_buy, task)
-            self.state.buy_order_id = None
-            self.state.buy_client_order_id = None
-        elif prev_buy_id is not None and exchange_buy is None:
-            center_price = self.state.last_center_price or self._get_current_price_with_retry(task)
-            if center_price is not None:
-                logger.warning("对账发现缺失买单，准备补挂")
-                self._place_opening_order_side(center_price, "BUY", task)
-
-        if prev_sell_id is None and exchange_sell:
-            logger.warning("对账发现多余卖单，准备撤单: %s", exchange_sell)
-            self._cancel_exchange_order(exchange_sell, task)
-            self.state.sell_order_id = None
-            self.state.sell_client_order_id = None
-        elif prev_sell_id is not None and exchange_sell is None:
-            center_price = self.state.last_center_price or self._get_current_price_with_retry(task)
-            if center_price is not None:
-                logger.warning("对账发现缺失卖单，准备补挂")
-                self._place_opening_order_side(center_price, "SELL", task)
-
-        exchange_tp_orders = {
-            int(order.get("orderId") or 0): order
-            for order in categories["tp_buy"] + categories["tp_sell"]
-        }
-        for record in prev_tp_records:
-            if record.order_id in exchange_tp_orders:
-                continue
-            entry_side = record.entry_side
-            if not entry_side and record.parent_id:
-                parent_record = self.lifecycle_manager.get_record(record.parent_id)
-                entry_side = parent_record.entry_side if parent_record else None
-            entry_price = self.state.last_entry_price.get(entry_side) if entry_side else None
-            entry_qty = self.state.last_entry_quantity.get(entry_side) if entry_side else None
-            if entry_side and entry_price and entry_qty:
-                logger.warning(
-                    "对账发现缺失止盈单，仅记录状态 entry_side=%s order_id=%s",
-                    entry_side,
-                    record.order_id,
-                )
-            else:
-                logger.warning(
-                    "对账发现缺失止盈单但缺少本地成交信息 order_id=%s entry_side=%s",
-                    record.order_id,
-                    entry_side,
-                )
-            self.lifecycle_manager.update_status(record.order_id, "FILLED")
-
-        for order in exchange_tp_orders.values():
-            order_id = int(order.get("orderId") or 0)
-            if order_id == 0:
-                continue
-            if order_id in prev_tp_ids:
-                continue
-            entry_side = "BUY" if order.get("positionSide") == "LONG" else "SELL"
-            tp_side = str(order.get("side"))
-            price = float(order.get("price") or 0)
-            if price <= 0:
-                continue
-            self.lifecycle_manager.add_tp(
-                order_id=order_id,
-                price=price,
-                parent_id=None,
-                entry_side=entry_side,
-                tp_side=tp_side,
-            )
-            self.state.tp_client_order_id[entry_side] = order.get("clientOrderId")
-
     def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
         if quantity <= 0:
             return
@@ -760,15 +601,6 @@ def _run_user_data_ws(
         nonlocal backoff_delay
         backoff_delay = 5
         logger.info("用户数据 WS 已连接")
-        engine.trade_queue.put(
-            TradeTask(
-                order_id=int(time.time() * 1000),
-                side="RECON",
-                price=0,
-                quantity=0,
-                task_type="reconcile",
-            )
-        )
 
     while not stop_event.is_set():
         listen_key_result = sdk.new_listen_key(engine.client)
@@ -839,10 +671,7 @@ def _trade_worker(engine: GridEngine, stop_event: threading.Event) -> None:
         except queue.Empty:
             continue
         try:
-            if task.task_type == "reconcile":
-                engine.reconcile_state(task)
-            else:
-                engine.process_trade_task(task)
+            engine.process_trade_task(task)
         except Exception:
             logger.exception("处理交易任务失败 task=%s", task)
         finally:
