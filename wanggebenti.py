@@ -428,6 +428,11 @@ class GridEngine:
         if not result or not result.get("ok"):
             self.logger.warning("撤单失败 order_id=%s result=%s", order_id, result)
             return
+        canceled_order_id = order_id
+        if canceled_order_id is None:
+            canceled_order_id = result.get("data", {}).get("orderId")
+        if canceled_order_id is not None:
+            self.lifecycle_manager.remove_record(canceled_order_id)
         self.logger.info("撤单完成 order_id=%s result=%s", order_id, result["data"])
 
     def handle_ws_fill(self, order_id: int, side: str, price: float, quantity: float) -> None:
@@ -539,7 +544,9 @@ def _handle_user_data_message(
             last_qty,
         )
         if order_id and engine.lifecycle_manager.has_tp_record(order_id):
-            if status in ["FILLED", "CANCELED", "EXPIRED", "REJECTED"]:
+            if status in ["CANCELED", "EXPIRED", "REJECTED"]:
+                engine.lifecycle_manager.remove_record(order_id)
+            if status == "FILLED":
                 tp_record = engine.lifecycle_manager.get_record(order_id)
                 parent_id = tp_record.parent_id if tp_record else None
                 engine.lifecycle_manager.remove_record(order_id)
