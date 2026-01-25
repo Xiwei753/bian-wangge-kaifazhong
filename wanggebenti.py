@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import importlib.util
 import queue
 import random
@@ -30,6 +30,34 @@ def _load_sdk_module():
 
 
 sdk = _load_sdk_module()
+
+
+@dataclass
+class KlineBuffer:
+    max_size: int = 100
+    _klines: List[Dict[str, object]] = field(default_factory=list, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def load_initial(self, klines: List[Dict[str, object]]) -> None:
+        with self._lock:
+            self._klines = sorted(klines, key=lambda item: item["open_time"])
+            if len(self._klines) > self.max_size:
+                self._klines = self._klines[-self.max_size :]
+
+    def add_or_update(self, kline: Dict[str, object]) -> None:
+        with self._lock:
+            open_time = kline["open_time"]
+            for index, existing in enumerate(self._klines):
+                if existing["open_time"] == open_time:
+                    self._klines[index] = kline
+                    return
+            self._klines.append(kline)
+            if len(self._klines) > self.max_size:
+                self._klines.pop(0)
+
+    def snapshot(self) -> List[Dict[str, object]]:
+        with self._lock:
+            return list(self._klines)
 
 
 @dataclass
@@ -67,6 +95,7 @@ class GridEngine:
         self.lifecycle_manager = LifecycleManager()
         self.stop_event = threading.Event()
         self.trade_queue: queue.Queue[TradeTask] = queue.Queue()
+        self.kline_buffer = KlineBuffer(max_size=100)
 
     def _build_client_order_id(self, task: "TradeTask", action: str) -> str:
         base = f"g{task.task_type[:2]}{task.order_id}{action}"
@@ -517,6 +546,100 @@ def _run_depth_ws(config: GridConfig, stop_event: threading.Event) -> None:
     ws_app.close()
 
 
+def _normalize_rest_kline(raw: List[object]) -> Dict[str, object]:
+    return {
+        "open_time": int(raw[0]),
+        "open": float(raw[1]),
+        "high": float(raw[2]),
+        "low": float(raw[3]),
+        "close": float(raw[4]),
+        "volume": float(raw[5]),
+        "close_time": int(raw[6]),
+        "is_closed": True,
+    }
+
+
+def _normalize_ws_kline(raw: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "open_time": int(raw["t"]),
+        "open": float(raw["o"]),
+        "high": float(raw["h"]),
+        "low": float(raw["l"]),
+        "close": float(raw["c"]),
+        "volume": float(raw["v"]),
+        "close_time": int(raw["T"]),
+        "is_closed": bool(raw["x"]),
+    }
+
+
+def _load_initial_klines(engine: GridEngine) -> None:
+    logger = logging.getLogger("KlineInit")
+    interval = f"{engine.config.timeframe_minutes}m"
+    result = sdk.get_klines(
+        engine.client,
+        symbol=engine.config.symbol,
+        interval=interval,
+        limit=100,
+    )
+    if not result.get("ok"):
+        logger.error("初始化拉取K线失败: %s", result)
+        return
+    raw_klines = result.get("data") or []
+    normalized = [_normalize_rest_kline(item) for item in raw_klines]
+    engine.kline_buffer.load_initial(normalized)
+    logger.info("已加载历史K线数量=%s interval=%s", len(normalized), interval)
+
+
+def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
+    logger = logging.getLogger("KlineWS")
+    interval = f"{engine.config.timeframe_minutes}m"
+
+    def on_message(_: sdk.websocket.WebSocketApp, message: str) -> None:
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            logger.warning("K线消息解析失败: %s", message)
+            return
+        if payload.get("e") != "kline":
+            logger.debug("忽略非K线消息: %s", payload.get("e"))
+            return
+        kline = payload.get("k")
+        if not isinstance(kline, dict):
+            logger.warning("K线字段缺失: %s", payload)
+            return
+        normalized = _normalize_ws_kline(kline)
+        engine.kline_buffer.add_or_update(normalized)
+        if normalized["is_closed"]:
+            logger.info("K线收盘 open_time=%s close=%s", normalized["open_time"], normalized["close"])
+
+    def on_error(_: sdk.websocket.WebSocketApp, error: Exception) -> None:
+        logger.error("K线 WS 错误: %s", error)
+
+    def on_close(_: sdk.websocket.WebSocketApp, status_code: int, msg: str) -> None:
+        logger.warning("K线 WS 关闭 code=%s msg=%s", status_code, msg)
+
+    def on_open(_: sdk.websocket.WebSocketApp) -> None:
+        logger.info("K线 WS 已连接 interval=%s", interval)
+
+    ws_app = sdk.subscribe_kline_ws(
+        symbol=engine.config.symbol,
+        interval=interval,
+        on_message=on_message,
+        use_testnet=engine.config.use_testnet,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+
+    while not stop_event.is_set():
+        ws_app.run_forever(ping_interval=20, ping_timeout=10)
+        if stop_event.is_set():
+            break
+        logger.warning("K线 WS 断开，5秒后重连")
+        time.sleep(5)
+    ws_app.close()
+
+
 def _handle_user_data_message(
     engine: GridEngine, logger: logging.Logger, message: str
 ) -> None:
@@ -689,10 +812,17 @@ def run_grid_loop() -> None:
     config = GridConfig()
     engine = GridEngine(config)
     engine.initialize()
+    _load_initial_klines(engine)
     depth_thread = threading.Thread(
         target=_run_depth_ws,
         args=(config, engine.stop_event),
         name="DepthWS",
+        daemon=True,
+    )
+    kline_thread = threading.Thread(
+        target=_run_kline_ws,
+        args=(engine, engine.stop_event),
+        name="KlineWS",
         daemon=True,
     )
     user_data_thread = threading.Thread(
@@ -708,6 +838,7 @@ def run_grid_loop() -> None:
         daemon=True,
     )
     depth_thread.start()
+    kline_thread.start()
     user_data_thread.start()
     trade_thread.start()
     engine.stop_event.wait()

@@ -463,6 +463,33 @@ def build_depth_stream_name(symbol: str, depth_level: int = 10, speed_ms: int = 
     return f"{symbol_lower}@depth{depth_level}@{speed_suffix}"
 
 
+def build_kline_stream_name(symbol: str, interval: str) -> str:
+    """构建 K 线 stream 名称。"""
+    symbol_lower = symbol.lower()
+    return f"{symbol_lower}@kline_{interval}"
+
+
+def subscribe_kline_ws(
+    symbol: str,
+    interval: str,
+    on_message: Callable[[websocket.WebSocketApp, str], None],
+    use_testnet: bool = False,
+    on_error: Optional[Callable[[websocket.WebSocketApp, Exception], None]] = None,
+    on_close: Optional[Callable[[websocket.WebSocketApp, int, str], None]] = None,
+    on_open: Optional[Callable[[websocket.WebSocketApp], None]] = None,
+) -> websocket.WebSocketApp:
+    """订阅指定交易对的 K 线数据，返回 WebSocketApp 实例。"""
+    stream = build_kline_stream_name(symbol, interval=interval)
+    ws_url = f"{get_ws_base_url(use_testnet=use_testnet)}/{stream}"
+    return websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+
+
 def subscribe_depth_ws(
     symbol: str,
     on_message: Callable[[websocket.WebSocketApp, str], None],
