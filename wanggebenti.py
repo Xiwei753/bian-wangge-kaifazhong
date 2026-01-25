@@ -17,6 +17,7 @@ import time
 
 from peizhi import GridConfig
 from zhiyingguanli import LifecycleManager
+from zhibiaojisuan import TechnicalIndicators
 
 
 def _load_sdk_module():
@@ -96,6 +97,12 @@ class GridEngine:
         self.stop_event = threading.Event()
         self.trade_queue: queue.Queue[TradeTask] = queue.Queue()
         self.kline_buffer = KlineBuffer(max_size=100)
+        self._indicator_lock = threading.Lock()
+        self.latest_indicators: Dict[str, float] = {}
+
+    def update_indicators(self, indicators: Dict[str, float]) -> None:
+        with self._indicator_lock:
+            self.latest_indicators = indicators
 
     def _build_client_order_id(self, task: "TradeTask", action: str) -> str:
         base = f"g{task.task_type[:2]}{task.order_id}{action}"
@@ -572,6 +579,28 @@ def _normalize_ws_kline(raw: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def _calculate_indicators(engine: GridEngine) -> Optional[Dict[str, float]]:
+    klines = engine.kline_buffer.snapshot()
+    if not klines:
+        return None
+    closes = [float(item["close"]) for item in klines]
+    atr_value = TechnicalIndicators.atr(klines, period=engine.config.atr_length)
+    bollinger = TechnicalIndicators.bollinger_bands(closes, period=20, std_dev=2)
+    momentum = TechnicalIndicators.momentum(closes, short_period=5, medium_period=10)
+    return {
+        "ema_fast": TechnicalIndicators.ema(closes, period=7),
+        "ema_slow": TechnicalIndicators.ema(closes, period=25),
+        "rsi": TechnicalIndicators.rsi(closes, period=14),
+        "atr": atr_value,
+        "bb_upper": bollinger["upper"],
+        "bb_middle": bollinger["middle"],
+        "bb_lower": bollinger["lower"],
+        "momentum_short": momentum["short"],
+        "momentum_medium": momentum["medium"],
+        "price": closes[-1],
+    }
+
+
 def _load_initial_klines(engine: GridEngine) -> None:
     logger = logging.getLogger("KlineInit")
     interval = f"{engine.config.timeframe_minutes}m"
@@ -609,6 +638,17 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
             return
         normalized = _normalize_ws_kline(kline)
         engine.kline_buffer.add_or_update(normalized)
+        indicators = _calculate_indicators(engine)
+        if indicators:
+            engine.update_indicators(indicators)
+            logger.debug(
+                "指标更新 price=%s rsi=%s ema_fast=%s ema_slow=%s atr=%s",
+                indicators["price"],
+                indicators["rsi"],
+                indicators["ema_fast"],
+                indicators["ema_slow"],
+                indicators["atr"],
+            )
         if normalized["is_closed"]:
             logger.info("K线收盘 open_time=%s close=%s", normalized["open_time"], normalized["close"])
 
