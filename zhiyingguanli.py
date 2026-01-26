@@ -16,8 +16,11 @@ class LifecycleRecord:
     parent_id: Optional[int]
     status: str
     price: float
+    quantity: Optional[float] = None
     entry_side: Optional[str] = None
     tp_side: Optional[str] = None
+    suspended_at: Optional[int] = None
+    suspend_reason: Optional[str] = None
     created_at: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
@@ -64,8 +67,17 @@ class LifecycleManager:
             parent_id=int(item["parent_id"]) if item.get("parent_id") is not None else None,
             status=str(item.get("status") or "NEW"),
             price=float(item["price"]),
+            quantity=(
+                float(item["quantity"]) if item.get("quantity") is not None else None
+            ),
             entry_side=str(item["entry_side"]) if item.get("entry_side") else None,
             tp_side=str(item["tp_side"]) if item.get("tp_side") else None,
+            suspended_at=(
+                int(item["suspended_at"]) if item.get("suspended_at") is not None else None
+            ),
+            suspend_reason=(
+                str(item["suspend_reason"]) if item.get("suspend_reason") else None
+            ),
             created_at=int(item.get("created_at") or 0),
         )
 
@@ -93,6 +105,7 @@ class LifecycleManager:
         self,
         order_id: int,
         price: float,
+        quantity: Optional[float],
         parent_id: Optional[int],
         entry_side: Optional[str],
         tp_side: Optional[str],
@@ -105,6 +118,7 @@ class LifecycleManager:
                 parent_id=parent_id,
                 status=status,
                 price=price,
+                quantity=quantity,
                 entry_side=entry_side,
                 tp_side=tp_side,
             )
@@ -121,6 +135,22 @@ class LifecycleManager:
             record = self._records.get(order_id)
             if record:
                 record.status = status
+                self._save()
+
+    def update_tp_quantity(self, order_id: int, quantity: float) -> None:
+        with self._lock:
+            record = self._records.get(order_id)
+            if record and record.type == "TP":
+                record.quantity = quantity
+                self._save()
+
+    def suspend_tp_record(self, order_id: int, reason: str) -> None:
+        with self._lock:
+            record = self._records.get(order_id)
+            if record and record.type == "TP":
+                record.status = "SUSPENDED"
+                record.suspended_at = int(time.time() * 1000)
+                record.suspend_reason = reason
                 self._save()
 
     def has_record(self, order_id: int) -> bool:

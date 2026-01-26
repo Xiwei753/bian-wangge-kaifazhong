@@ -38,7 +38,7 @@ class Module1_TrendScoring:
     输入：指标数据
     输出：原始分数 & 初步方向
     """
-    def run(self, input_data):
+    def run(self, input_data, verbose: bool = False):
         score = 0.0
         details = []
 
@@ -62,8 +62,9 @@ class Module1_TrendScoring:
         if input_data['price'] > input_data['bb_upper']:
             score += 0.5; details.append("顶破上轨(+0.5)")
             
-        print(f"  [1.评分] 因子详情: {', '.join(details)}")
-        print(f"  [1.评分] 原始总分: {score}")
+        if verbose:
+            print(f"  [1.评分] 因子详情: {', '.join(details)}")
+            print(f"  [1.评分] 原始总分: {score}")
         
         # 归一化强度 (0~1)
         raw_strength = min(abs(score) / 5.0, 1.0)
@@ -84,13 +85,14 @@ class Module2_SignalContinuation:
     输入：当前信号 + 历史信号
     输出：修正后的强度 & 置信度
     """
-    def run(self, current_dir, current_strength, history_state):
+    def run(self, current_dir, current_strength, history_state, verbose: bool = False):
         confidence = 1.0
         
         # 场景 A: 信号发生突变 (比如从 震荡 -> 上涨)
         if current_dir != history_state['last_direction']:
-            print(f"  [2.延续] ⚠️ 信号突变 ({history_state['last_direction']} -> {current_dir})")
-            print(f"  [2.延续] 启动防莽机制：置信度打折，重置持续时间。")
+            if verbose:
+                print(f"  [2.延续] ⚠️ 信号突变 ({history_state['last_direction']} -> {current_dir})")
+                print(f"  [2.延续] 启动防莽机制：置信度打折，重置持续时间。")
             
             confidence *= config.confidence_penalty # 打7折
             duration = 1
@@ -98,13 +100,15 @@ class Module2_SignalContinuation:
         # 场景 B: 信号保持一致
         else:
             duration = history_state['duration'] + 1
-            print(f"  [2.延续] ✅ 信号延续中 (持续 {duration} 周期)")
+            if verbose:
+                print(f"  [2.延续] ✅ 信号延续中 (持续 {duration} 周期)")
             
             if duration >= 2:
                 # 奖励：趋势确认，增强强度
                 current_strength *= config.persistence_bonus
                 current_strength = min(current_strength, 1.0)
-                print(f"  [2.延续] 趋势确认：强度获得加成 -> {current_strength:.2f}")
+                if verbose:
+                    print(f"  [2.延续] 趋势确认：强度获得加成 -> {current_strength:.2f}")
 
         return current_strength, confidence, duration
 
@@ -146,16 +150,18 @@ class Module4_DynamicWeights:
     输入：市场状态
     输出：BB/ATR/Trend 三者的权重
     """
-    def run(self, market_state):
+    def run(self, market_state, verbose: bool = False):
         w_bb = config.weight_bb_default
         w_atr = config.weight_atr_default
         w_trend = config.weight_trend_default
         
         if market_state == MarketMode.CONSOLIDATION:
-            print("  [4.权重] 震荡市：使用默认权重 (关注布林带和ATR)。")
+            if verbose:
+                print("  [4.权重] 震荡市：使用默认权重 (关注布林带和ATR)。")
             
         elif market_state == MarketMode.TREND:
-            print("  [4.权重] 一般趋势：增加趋势权重，降低震荡指标权重。")
+            if verbose:
+                print("  [4.权重] 一般趋势：增加趋势权重，降低震荡指标权重。")
             w_trend += 0.3
             w_bb -= 0.15
             w_atr -= 0.15
@@ -165,7 +171,7 @@ class Module4_DynamicWeights:
 
 class Module5_StepCalculation:
     """模块五：网格步长最终计算 (关联真实波动率)"""
-    def run(self, weights, direction, strength, indicators):
+    def run(self, weights, direction, strength, indicators, verbose: bool = False):
         w_bb, w_atr, w_trend = weights
         price = indicators.get('price', 1.0)
 
@@ -195,7 +201,8 @@ class Module5_StepCalculation:
                     (step_atr_suggestion * w_atr) + \
                     (step_trend_suggestion * w_trend)
 
-        print(f"  [5.步长] 加权基础步长: {base_step:.4%}")
+        if verbose:
+            print(f"  [5.步长] 加权基础步长: {base_step:.4%}")
         
         # 2. 顺势/逆势 非对称调整
         long_step = base_step
@@ -210,9 +217,10 @@ class Module5_StepCalculation:
             expand = 1.0 + (strength * config.counter_expansion_max)
             short_step *= expand
             
-            print(f"  [5.步长] ⬆️ 上涨模式调整:")
-            print(f"     -> 买单(顺): {long_step:.4%} (加密x{compress:.2f})")
-            print(f"     -> 卖单(逆): {short_step:.4%} (加宽x{expand:.2f})")
+            if verbose:
+                print(f"  [5.步长] ⬆️ 上涨模式调整:")
+                print(f"     -> 买单(顺): {long_step:.4%} (加密x{compress:.2f})")
+                print(f"     -> 卖单(逆): {short_step:.4%} (加宽x{expand:.2f})")
             
         elif direction == "DOWNTREND":
             # 顺势(卖单)：加密
@@ -223,9 +231,10 @@ class Module5_StepCalculation:
             expand = 1.0 + (strength * config.counter_expansion_max)
             long_step *= expand
             
-            print(f"  [5.步长] ⬇️ 下跌模式调整:")
-            print(f"     -> 卖单(顺): {short_step:.4%} (加密x{compress:.2f})")
-            print(f"     -> 买单(逆): {long_step:.4%} (加宽x{expand:.2f})")
+            if verbose:
+                print(f"  [5.步长] ⬇️ 下跌模式调整:")
+                print(f"     -> 卖单(顺): {short_step:.4%} (加密x{compress:.2f})")
+                print(f"     -> 买单(逆): {long_step:.4%} (加宽x{expand:.2f})")
             
         return long_step, short_step
 
@@ -284,12 +293,29 @@ class AdvancedTrendAnalyzer:
             self._history_state["market_mode"],
             volatility_ratio=vol_ratio,
         )
-        w_bb, w_atr, w_trend = self.module_weights.run(market_mode)
+        log_on_switch = market_mode != self._history_state["market_mode"]
+
+        if log_on_switch:
+            direction, raw_strength, score = self.module_scoring.run(indicators, verbose=True)
+            strength, confidence, duration = self.module_continuation.run(
+                direction,
+                raw_strength,
+                self._history_state,
+                verbose=True,
+            )
+            market_mode = self.module_market.run(
+                score,
+                self._history_state["market_mode"],
+                volatility_ratio=vol_ratio,
+            )
+
+        w_bb, w_atr, w_trend = self.module_weights.run(market_mode, verbose=log_on_switch)
         long_step, short_step = self.module_step.run(
             (w_bb, w_atr, w_trend),
             direction,
             strength,
             indicators,
+            verbose=log_on_switch,
         )
 
         self._history_state = {
