@@ -101,24 +101,41 @@ class GridEngine:
         self._indicator_lock = threading.Lock()
         self.latest_indicators: Dict[str, float] = {}
         self.trend_analyzer = AdvancedTrendAnalyzer(config)
+        self._decision_lock = threading.Lock()
+        self.current_decision: Optional[StrategyDecision] = None
 
     def update_indicators(self, indicators: Dict[str, float]) -> None:
         with self._indicator_lock:
             self.latest_indicators = indicators
 
+    def _set_current_decision(self, decision: StrategyDecision) -> None:
+        with self._decision_lock:
+            self.current_decision = decision
+        self.config.market_mode = decision.market_mode
+
+    def _get_current_decision(self) -> Optional[StrategyDecision]:
+        with self._decision_lock:
+            return self.current_decision
+
     def analyze_initial_trend(self) -> Optional[StrategyDecision]:
-        klines = self.kline_buffer.snapshot()
-        if not klines:
+        decision = self.analyze_market()
+        if decision is None:
             self.logger.warning("历史K线为空，无法进行趋势分析")
             return None
-        decision = self.trend_analyzer.analyze(klines)
-        self.config.market_mode = decision.market_mode
         self.logger.info(
             "启动趋势分析完成 market_mode=%s score=%.2f strength=%.2f",
             decision.market_mode.value,
             decision.score,
             decision.strength,
         )
+        return decision
+
+    def analyze_market(self) -> Optional[StrategyDecision]:
+        klines = self.kline_buffer.snapshot()
+        if not klines:
+            return None
+        decision = self.trend_analyzer.analyze(klines)
+        self._set_current_decision(decision)
         return decision
 
     def _build_client_order_id(self, task: "TradeTask", action: str) -> str:
@@ -242,17 +259,13 @@ class GridEngine:
         default_buy_step = center_price * self._get_open_step_ratio("BUY")
         default_sell_step = center_price * self._get_open_step_ratio("SELL")
 
-        current_score = 0.5 
-        threshold = 0.7
-        current_direction = "UP" 
-
-        if current_score < threshold:
+        decision = self._get_current_decision()
+        if decision is None:
             return default_buy_step, default_sell_step
-        else:
-            if current_direction == "UP":
-                return default_buy_step, None
-            else:
-                return None, default_sell_step
+
+        buy_step = center_price * decision.long_step
+        sell_step = center_price * decision.short_step
+        return buy_step, sell_step
 
     def _place_opening_order_side(
         self, center_price: float, side: str, task: "TradeTask"
@@ -665,6 +678,14 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
                 indicators["ema_fast"],
                 indicators["ema_slow"],
                 indicators["atr"],
+            )
+        decision = engine.analyze_market()
+        if decision:
+            logger.debug(
+                "市场分析更新 mode=%s score=%.2f strength=%.2f",
+                decision.market_mode.value,
+                decision.score,
+                decision.strength,
             )
         if normalized["is_closed"]:
             logger.info("K线收盘 open_time=%s close=%s", normalized["open_time"], normalized["close"])
