@@ -16,6 +16,7 @@ import threading
 import time
 
 from peizhi import GridConfig
+from qushifenxi import AdvancedTrendAnalyzer, StrategyDecision
 from zhiyingguanli import LifecycleManager
 from zhibiaojisuan import TechnicalIndicators
 
@@ -99,10 +100,26 @@ class GridEngine:
         self.kline_buffer = KlineBuffer(max_size=100)
         self._indicator_lock = threading.Lock()
         self.latest_indicators: Dict[str, float] = {}
+        self.trend_analyzer = AdvancedTrendAnalyzer(config)
 
     def update_indicators(self, indicators: Dict[str, float]) -> None:
         with self._indicator_lock:
             self.latest_indicators = indicators
+
+    def analyze_initial_trend(self) -> Optional[StrategyDecision]:
+        klines = self.kline_buffer.snapshot()
+        if not klines:
+            self.logger.warning("历史K线为空，无法进行趋势分析")
+            return None
+        decision = self.trend_analyzer.analyze(klines)
+        self.config.market_mode = decision.market_mode
+        self.logger.info(
+            "启动趋势分析完成 market_mode=%s score=%.2f strength=%.2f",
+            decision.market_mode.value,
+            decision.score,
+            decision.strength,
+        )
+        return decision
 
     def _build_client_order_id(self, task: "TradeTask", action: str) -> str:
         base = f"g{task.task_type[:2]}{task.order_id}{action}"
@@ -851,8 +868,9 @@ def _trade_worker(engine: GridEngine, stop_event: threading.Event) -> None:
 def run_grid_loop() -> None:
     config = GridConfig()
     engine = GridEngine(config)
-    engine.initialize()
     _load_initial_klines(engine)
+    engine.analyze_initial_trend()
+    engine.initialize()
     depth_thread = threading.Thread(
         target=_run_depth_ws,
         args=(config, engine.stop_event),
