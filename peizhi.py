@@ -12,7 +12,7 @@ class MarketMode(str, Enum):
 @dataclass
 class GridConfig:
     """网格策略配置 - 完整动态网格版本"""
-    
+
     def __init__(self):
         # ===================== 基础交易配置 =====================
         self.symbol: str = "BTCUSDC"
@@ -24,6 +24,27 @@ class GridConfig:
         self.long_open_short_tp_step_ratio: float = 0.001
         self.short_open_long_tp_step_ratio: float = 0.001
         self.market_mode: MarketMode = MarketMode.CONSOLIDATION
+
+        # ===================== 趋势评分配置 =====================
+        self.score_bullish: float = 3.0
+        self.score_bearish: float = -3.0
+
+        # ===================== 信号延续配置 =====================
+        self.confidence_penalty: float = 0.7
+        self.persistence_bonus: float = 1.1
+
+        # ===================== 状态切换阈值配置 =====================
+        self.base_activation: float = 0.6
+        self.volatility_factor: float = 0.2
+
+        # ===================== 动态权重配置 =====================
+        self.weight_bb_default: float = 0.4
+        self.weight_atr_default: float = 0.4
+        self.weight_trend_default: float = 0.2
+
+        # ===================== 网格调整配置 =====================
+        self.trend_compression_max: float = 0.4
+        self.counter_expansion_max: float = 1.0
         
         # ===================== 功能开关配置 =====================
         self.enable_wechat_push: bool = True

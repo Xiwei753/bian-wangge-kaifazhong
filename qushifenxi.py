@@ -4,33 +4,28 @@
 # 这是一个逻辑演示文件，用于展示策略"大脑"是如何思考的。
 # ==============================================================================
 
-import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-# ==============================================================================
-# [一] 全局参数配置 (The Rules)
-# ==============================================================================
-class Config:
-    # 1. 评分标准
-    SCORE_BULLISH = 3.0    # >3 分看涨
-    SCORE_BEARISH = -3.0   # <-3 分看跌
-    
-    # 2. 信号延续 (防莽夫：防止刚出信号就满仓)
-    CONFIDENCE_PENALTY = 0.7  # 新信号第一根K线，置信度打7折
-    PERSISTENCE_BONUS = 1.1   # 信号延续多根K线，强度奖励10%
-    
-    # 3. 状态切换阈值 (防抖动：防止在临界点反复横跳)
-    BASE_ACTIVATION = 0.6     # 基础进入趋势的强度门槛
-    VOLATILITY_FACTOR = 0.2   # 波动率对门槛的加成系数
-    
-    # 4. 动态权重 (决定谁主导网格步长)
-    # 默认：ATR和布林带各占40%，趋势占20%
-    WEIGHT_BB_DEFAULT = 0.4
-    WEIGHT_ATR_DEFAULT = 0.4
-    WEIGHT_TREND_DEFAULT = 0.2
-    
-    # 5. 网格调整系数
-    TREND_COMPRESSION_MAX = 0.4  # 顺势网格最大加密 40%
-    COUNTER_EXPANSION_MAX = 1.0  # 逆势网格最大加宽 100%
+from peizhi import GridConfig, MarketMode
+from zhibiaojisuan import TechnicalIndicators
+
+config = GridConfig()
+
+
+@dataclass
+class StrategyDecision:
+    """打包策略输出，供主程序读取"""
+    direction: str
+    strength: float
+    confidence: float
+    duration: int
+    score: float
+    market_mode: MarketMode
+    weights: Dict[str, float]
+    long_step: float
+    short_step: float
+    indicators: Dict[str, float]
 
 
 # ==============================================================================
@@ -75,10 +70,12 @@ class Module1_TrendScoring:
         
         # 初步定方向
         direction = "SIDEWAYS"
-        if score >= Config.SCORE_BULLISH: direction = "UPTREND"
-        elif score <= Config.SCORE_BEARISH: direction = "DOWNTREND"
-        
-        return direction, raw_strength
+        if score >= config.score_bullish:
+            direction = "UPTREND"
+        elif score <= config.score_bearish:
+            direction = "DOWNTREND"
+
+        return direction, raw_strength, score
 
 
 class Module2_SignalContinuation:
@@ -95,7 +92,7 @@ class Module2_SignalContinuation:
             print(f"  [2.延续] ⚠️ 信号突变 ({history_state['last_direction']} -> {current_dir})")
             print(f"  [2.延续] 启动防莽机制：置信度打折，重置持续时间。")
             
-            confidence *= Config.CONFIDENCE_PENALTY # 打7折
+            confidence *= config.confidence_penalty # 打7折
             duration = 1
             
         # 场景 B: 信号保持一致
@@ -105,52 +102,27 @@ class Module2_SignalContinuation:
             
             if duration >= 2:
                 # 奖励：趋势确认，增强强度
-                current_strength *= Config.PERSISTENCE_BONUS
+                current_strength *= config.persistence_bonus
                 current_strength = min(current_strength, 1.0)
                 print(f"  [2.延续] 趋势确认：强度获得加成 -> {current_strength:.2f}")
 
         return current_strength, confidence, duration
 
 
-class Module3_StateHysteresis:
+class Module3_MarketModeSwitch:
     """
-    模块三：双阈值状态机 (Schmitt Trigger 防抖)
-    输入：强度 + 波动率 + 上一刻状态
-    输出：最终市场状态 (Consolidation/Trending)
+    模块三：市场切换 (两种市场状态)
+    输入：评分 + 上一刻市场
+    输出：市场状态 (Consolidation/Trend)
     """
-    def run(self, strength, volatility_idx, last_state):
-        # 1. 计算动态门槛
-        # 波动率越大(volatility_idx越大)，门槛越高
-        # 进门门槛 (Entry): 比如 0.6 * 1.2 = 0.72
-        threshold_entry = Config.BASE_ACTIVATION * (1.0 + volatility_idx * Config.VOLATILITY_FACTOR)
-        # 出门门槛 (Exit):  比如 0.6 * 0.8 = 0.48
-        threshold_exit  = Config.BASE_ACTIVATION * (1.0 - volatility_idx * 0.1)  
-        
-        print(f"  [3.防抖] 当前强度: {strength:.2f}")
-        print(f"  [3.防抖] 动态门槛: 进门>{threshold_entry:.2f} | 出门<{threshold_exit:.2f}")
-        
-        new_state = last_state # 默认保持
-        
-        # 逻辑：进门难，出门难
-        if last_state == "CONSOLIDATION":
-            if strength > threshold_entry:
-                new_state = "TRENDING"
-                print("  [3.防抖] 🚀 突破高门槛，切换至 [TRENDING]!")
-            else:
-                print("  [3.防抖] 未突破高门槛，保持 [CONSOLIDATION]。")
-                
-        elif last_state == "TRENDING":
-            if strength < threshold_exit:
-                new_state = "CONSOLIDATION"
-                print("  [3.防抖] 📉 跌破低门槛，切换至 [CONSOLIDATION]。")
-            else:
-                print("  [3.防抖] 未跌破低门槛，维持 [TRENDING]。")
-                
-        # 判定极端趋势
-        if new_state == "TRENDING" and strength > 0.8:
-            new_state = "EXTREME_TREND"
-            print("  [3.防抖] 🔥 强度爆表，判定为 [EXTREME_TREND]!")
-            
+    def run(self, score, last_state):
+        new_state = last_state
+        if score >= config.score_bullish or score <= config.score_bearish:
+            new_state = MarketMode.TREND
+        else:
+            new_state = MarketMode.CONSOLIDATION
+
+        print(f"  [3.市场] 当前评分: {score:.2f} -> 市场状态: {new_state.value}")
         return new_state
 
 
@@ -161,25 +133,18 @@ class Module4_DynamicWeights:
     输出：BB/ATR/Trend 三者的权重
     """
     def run(self, market_state):
-        w_bb = Config.WEIGHT_BB_DEFAULT
-        w_atr = Config.WEIGHT_ATR_DEFAULT
-        w_trend = Config.WEIGHT_TREND_DEFAULT
+        w_bb = config.weight_bb_default
+        w_atr = config.weight_atr_default
+        w_trend = config.weight_trend_default
         
-        if market_state == "CONSOLIDATION":
+        if market_state == MarketMode.CONSOLIDATION:
             print("  [4.权重] 震荡市：使用默认权重 (关注布林带和ATR)。")
             
-        elif market_state == "TRENDING":
+        elif market_state == MarketMode.TREND:
             print("  [4.权重] 一般趋势：增加趋势权重，降低震荡指标权重。")
             w_trend += 0.3
             w_bb -= 0.15
             w_atr -= 0.15
-            
-        elif market_state == "EXTREME_TREND":
-            print("  [4.权重] 🚨 极端趋势：强制忽略布林带！全力跟随趋势！")
-            # 这里的逻辑是你提到的关键点
-            w_bb = 0.02    # 2% (几乎忽略)
-            w_atr = 0.02   # 2% (几乎忽略)
-            w_trend = 0.96 # 96%
             
         return w_bb, w_atr, w_trend
 
@@ -210,11 +175,11 @@ class Module5_StepCalculation:
         
         if direction == "UPTREND":
             # 顺势(买單)：加密，為了多上車
-            compress = 1.0 - (strength * Config.TREND_COMPRESSION_MAX)
+            compress = 1.0 - (strength * config.trend_compression_max)
             long_step *= compress
             
             # 逆势(卖单)：加宽，防卖飞/防早空
-            expand = 1.0 + (strength * Config.COUNTER_EXPANSION_MAX)
+            expand = 1.0 + (strength * config.counter_expansion_max)
             short_step *= expand
             
             print(f"  [5.步长] ⬆️ 上涨模式调整:")
@@ -223,11 +188,11 @@ class Module5_StepCalculation:
             
         elif direction == "DOWNTREND":
             # 顺势(卖单)：加密
-            compress = 1.0 - (strength * Config.TREND_COMPRESSION_MAX)
+            compress = 1.0 - (strength * config.trend_compression_max)
             short_step *= compress
             
             # 逆势(买单)：加宽
-            expand = 1.0 + (strength * Config.COUNTER_EXPANSION_MAX)
+            expand = 1.0 + (strength * config.counter_expansion_max)
             long_step *= expand
             
             print(f"  [5.步长] ⬇️ 下跌模式调整:")
@@ -235,3 +200,77 @@ class Module5_StepCalculation:
             print(f"     -> 买单(逆): {long_step:.4%} (加宽x{expand:.2f})")
             
         return long_step, short_step
+
+
+class AdvancedTrendAnalyzer:
+    """主类：管理历史状态并串联各模块"""
+    def __init__(self, config_override: Optional[GridConfig] = None):
+        global config
+        if config_override is not None:
+            config = config_override
+        self.config = config
+        self.module_scoring = Module1_TrendScoring()
+        self.module_continuation = Module2_SignalContinuation()
+        self.module_market = Module3_MarketModeSwitch()
+        self.module_weights = Module4_DynamicWeights()
+        self.module_step = Module5_StepCalculation()
+        self._history_state = {
+            "last_direction": "SIDEWAYS",
+            "duration": 0,
+            "market_mode": MarketMode.CONSOLIDATION,
+        }
+
+    def _build_indicators(self, klines: List[Dict]) -> Dict[str, float]:
+        prices = [kline.get("close") for kline in klines]
+        ema_fast = TechnicalIndicators.ema(prices, period=12)
+        ema_slow = TechnicalIndicators.ema(prices, period=26)
+        rsi = TechnicalIndicators.rsi(prices, period=14)
+        momentum = TechnicalIndicators.momentum(prices, short_period=5, medium_period=10)
+        bb = TechnicalIndicators.bollinger_bands(prices, period=20, std_dev=2)
+        price = TechnicalIndicators._to_float(prices[-1]) if prices else 0.0
+
+        return {
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "rsi": rsi,
+            "momentum": momentum["short"],
+            "price": price,
+            "bb_upper": bb["upper"],
+        }
+
+    def analyze(self, klines: List[Dict]) -> StrategyDecision:
+        indicators = self._build_indicators(klines)
+        direction, raw_strength, score = self.module_scoring.run(indicators)
+
+        strength, confidence, duration = self.module_continuation.run(
+            direction,
+            raw_strength,
+            self._history_state,
+        )
+
+        market_mode = self.module_market.run(score, self._history_state["market_mode"])
+        w_bb, w_atr, w_trend = self.module_weights.run(market_mode)
+        long_step, short_step = self.module_step.run(
+            (w_bb, w_atr, w_trend),
+            direction,
+            strength,
+        )
+
+        self._history_state = {
+            "last_direction": direction,
+            "duration": duration,
+            "market_mode": market_mode,
+        }
+
+        return StrategyDecision(
+            direction=direction,
+            strength=strength,
+            confidence=confidence,
+            duration=duration,
+            score=score,
+            market_mode=market_mode,
+            weights={"bb": w_bb, "atr": w_atr, "trend": w_trend},
+            long_step=long_step,
+            short_step=short_step,
+            indicators=indicators,
+        )

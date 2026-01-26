@@ -26,27 +26,33 @@ class LifecycleManager:
         self.storage_path = storage_path or Path(__file__).with_name("zhiying_records.json")
         self._lock = threading.Lock()
         self._records: Dict[int, LifecycleRecord] = {}
-        self._load()
+        self._records = self._load_records()
 
-    def _load(self) -> None:
+    def _load_records(self) -> Dict[int, LifecycleRecord]:
+        records: Dict[int, LifecycleRecord] = {}
         if not self.storage_path.exists():
-            return
+            return records
         try:
             raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return
+            return records
         if isinstance(raw, list):
             items = raw
         elif isinstance(raw, dict):
             items = raw.get("records", [])
         else:
-            return
+            return records
         for item in items:
             try:
                 record = self._parse_record(item)
             except (KeyError, TypeError, ValueError):
                 continue
-            self._records[record.order_id] = record
+            records[record.order_id] = record
+        return records
+
+    def reload_from_disk(self) -> None:
+        with self._lock:
+            self._records = self._load_records()
 
     def _parse_record(self, item: dict) -> LifecycleRecord:
         record_type = item.get("type")

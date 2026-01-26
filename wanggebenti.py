@@ -16,7 +16,9 @@ import threading
 import time
 
 from peizhi import GridConfig
+from qushifenxi import AdvancedTrendAnalyzer, StrategyDecision
 from zhiyingguanli import LifecycleManager
+from zhiyingtiaozheng import TrendTakeProfitAdjuster
 from zhibiaojisuan import TechnicalIndicators
 
 
@@ -99,10 +101,49 @@ class GridEngine:
         self.kline_buffer = KlineBuffer(max_size=100)
         self._indicator_lock = threading.Lock()
         self.latest_indicators: Dict[str, float] = {}
+        self.trend_analyzer = AdvancedTrendAnalyzer(config)
+        self.tp_adjuster = TrendTakeProfitAdjuster(
+            client=self.client,
+            config=self.config,
+            lifecycle_manager=self.lifecycle_manager,
+            logger=self.logger,
+        )
+        self._decision_lock = threading.Lock()
+        self.current_decision: Optional[StrategyDecision] = None
 
     def update_indicators(self, indicators: Dict[str, float]) -> None:
         with self._indicator_lock:
             self.latest_indicators = indicators
+
+    def _set_current_decision(self, decision: StrategyDecision) -> None:
+        with self._decision_lock:
+            self.current_decision = decision
+        self.config.market_mode = decision.market_mode
+
+    def _get_current_decision(self) -> Optional[StrategyDecision]:
+        with self._decision_lock:
+            return self.current_decision
+
+    def analyze_initial_trend(self) -> Optional[StrategyDecision]:
+        decision = self.analyze_market()
+        if decision is None:
+            self.logger.warning("历史K线为空，无法进行趋势分析")
+            return None
+        self.logger.info(
+            "启动趋势分析完成 market_mode=%s score=%.2f strength=%.2f",
+            decision.market_mode.value,
+            decision.score,
+            decision.strength,
+        )
+        return decision
+
+    def analyze_market(self) -> Optional[StrategyDecision]:
+        klines = self.kline_buffer.snapshot()
+        if not klines:
+            return None
+        decision = self.trend_analyzer.analyze(klines)
+        self._set_current_decision(decision)
+        return decision
 
     def _build_client_order_id(self, task: "TradeTask", action: str) -> str:
         base = f"g{task.task_type[:2]}{task.order_id}{action}"
@@ -225,17 +266,13 @@ class GridEngine:
         default_buy_step = center_price * self._get_open_step_ratio("BUY")
         default_sell_step = center_price * self._get_open_step_ratio("SELL")
 
-        current_score = 0.5 
-        threshold = 0.7
-        current_direction = "UP" 
-
-        if current_score < threshold:
+        decision = self._get_current_decision()
+        if decision is None:
             return default_buy_step, default_sell_step
-        else:
-            if current_direction == "UP":
-                return default_buy_step, None
-            else:
-                return None, default_sell_step
+
+        buy_step = center_price * decision.long_step
+        sell_step = center_price * decision.short_step
+        return buy_step, sell_step
 
     def _place_opening_order_side(
         self, center_price: float, side: str, task: "TradeTask"
@@ -649,6 +686,34 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
                 indicators["ema_slow"],
                 indicators["atr"],
             )
+        decision = engine.analyze_market()
+        if decision:
+            logger.debug(
+                "市场分析更新 mode=%s score=%.2f strength=%.2f",
+                decision.market_mode.value,
+                decision.score,
+                decision.strength,
+            )
+        try:
+            current_price = indicators["price"] if indicators else float(normalized["close"])
+            active_decision = decision or engine._get_current_decision()
+            long_step_ratio = (
+                active_decision.long_step
+                if active_decision
+                else engine.config.long_open_short_tp_step_ratio
+            )
+            short_step_ratio = (
+                active_decision.short_step
+                if active_decision
+                else engine.config.short_open_long_tp_step_ratio
+            )
+            engine.tp_adjuster.adjust_take_profit_for_trend(
+                current_price=current_price,
+                long_step_ratio=long_step_ratio,
+                short_step_ratio=short_step_ratio,
+            )
+        except Exception as exc:
+            logger.exception("WS止盈调整异常: %s", exc)
         if normalized["is_closed"]:
             logger.info("K线收盘 open_time=%s close=%s", normalized["open_time"], normalized["close"])
 
@@ -851,8 +916,9 @@ def _trade_worker(engine: GridEngine, stop_event: threading.Event) -> None:
 def run_grid_loop() -> None:
     config = GridConfig()
     engine = GridEngine(config)
-    engine.initialize()
     _load_initial_klines(engine)
+    engine.analyze_initial_trend()
+    engine.initialize()
     depth_thread = threading.Thread(
         target=_run_depth_ws,
         args=(config, engine.stop_event),
