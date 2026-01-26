@@ -110,19 +110,33 @@ class Module2_SignalContinuation:
 
 
 class Module3_MarketModeSwitch:
-    """
-    模块三：市场切换 (两种市场状态)
-    输入：评分 + 上一刻市场
-    输出：市场状态 (Consolidation/Trend)
-    """
-    def run(self, score, last_state):
-        new_state = last_state
-        if score >= config.score_bullish or score <= config.score_bearish:
-            new_state = MarketMode.TREND
-        else:
-            new_state = MarketMode.CONSOLIDATION
+    """模块三：市场切换 (带防抖滞后阀)"""
+    def run(self, score, last_state, volatility_ratio=0.0): # 增加波动率参数
+        # 将分数转为强度 0-1
+        strength = min(abs(score) / 5.0, 1.0)
 
-        print(f"  [3.市场] 当前评分: {score:.2f} -> 市场状态: {new_state.value}")
+        # 动态计算门槛 (波动越大，门槛越高)
+        # 基础激活分对应的强度，例如 3.0分/5.0 = 0.6
+        base_strength = config.base_activation
+
+        # 进门难 (Entry): 0.6 * 1.2 = 0.72
+        threshold_entry = base_strength * (1.0 + volatility_ratio * config.volatility_factor)
+        # 出门难 (Exit):  0.6 * 0.9 = 0.54
+        threshold_exit  = base_strength * (1.0 - volatility_ratio * 0.1)
+
+        new_state = last_state
+
+        if last_state == MarketMode.CONSOLIDATION:
+            # 必须非常强才能进入趋势
+            if strength > threshold_entry:
+                new_state = MarketMode.TREND
+        else: # TREND
+            # 必须掉得很多才退回震荡
+            if strength < threshold_exit:
+                new_state = MarketMode.CONSOLIDATION
+
+        # 打印调试信息
+        # print(f"  [3.防抖] 强度:{strength:.2f} 阈值(进/出):{threshold_entry:.2f}/{threshold_exit:.2f} -> {new_state.value}")
         return new_state
 
 
@@ -150,23 +164,37 @@ class Module4_DynamicWeights:
 
 
 class Module5_StepCalculation:
-    """
-    模块五：网格步长最终计算
-    输入：权重 + 方向 + 强度
-    输出：买单步长 & 卖单步长
-    """
-    def run(self, weights, direction, strength, base_atr_step=0.005):
+    """模块五：网格步长最终计算 (关联真实波动率)"""
+    def run(self, weights, direction, strength, indicators):
         w_bb, w_atr, w_trend = weights
-        
-        # 1. 计算加权基础步长 (为了演示，假设各指标给出的建议值)
-        step_bb_suggestion = 0.006
-        step_atr_suggestion = 0.004
-        step_trend_suggestion = 0.008 # 趋势越强通常建议步长越宽以防被套
-        
+        price = indicators.get('price', 1.0)
+
+        # 1. 计算基于 ATR 的真实建议步长
+        atr_value = indicators.get('atr', 0)
+        # 如果 ATR=100, Price=10000, Ratio=0.01。
+        # 原策略设定 ATR 倍数 (比如 ATR的一半作为半格)
+        step_atr_suggestion = (atr_value / price) * 0.5 if price > 0 else 0.004
+        # 限制在合理范围内 (0.1% - 1%)
+        step_atr_suggestion = max(0.001, min(step_atr_suggestion, 0.01))
+
+        # 2. 计算基于布林带的建议步长 (带宽越大步长越大)
+        upper = indicators.get('bb_upper', 0)
+        # 这里简化计算，假设中轨约等于 price
+        if upper > 0 and price > 0:
+            bb_width = (upper - price) / price # 半带宽
+            step_bb_suggestion = bb_width * 0.5
+        else:
+            step_bb_suggestion = 0.004
+        step_bb_suggestion = max(0.001, min(step_bb_suggestion, 0.01))
+
+        # 3. 趋势因子步长 (趋势越强，基础网格稍微放宽防被套，后面再由 compress 压缩)
+        step_trend_suggestion = 0.005 * (1 + strength)
+
+        # 加权
         base_step = (step_bb_suggestion * w_bb) + \
                     (step_atr_suggestion * w_atr) + \
                     (step_trend_suggestion * w_trend)
-                    
+
         print(f"  [5.步长] 加权基础步长: {base_step:.4%}")
         
         # 2. 顺势/逆势 非对称调整
@@ -227,6 +255,7 @@ class AdvancedTrendAnalyzer:
         rsi = TechnicalIndicators.rsi(prices, period=14)
         momentum = TechnicalIndicators.momentum(prices, short_period=5, medium_period=10)
         bb = TechnicalIndicators.bollinger_bands(prices, period=20, std_dev=2)
+        atr_value = TechnicalIndicators.atr(klines, period=config.atr_length)
         price = TechnicalIndicators._to_float(prices[-1]) if prices else 0.0
 
         return {
@@ -236,6 +265,7 @@ class AdvancedTrendAnalyzer:
             "momentum": momentum["short"],
             "price": price,
             "bb_upper": bb["upper"],
+            "atr": atr_value,
         }
 
     def analyze(self, klines: List[Dict]) -> StrategyDecision:
@@ -248,12 +278,18 @@ class AdvancedTrendAnalyzer:
             self._history_state,
         )
 
-        market_mode = self.module_market.run(score, self._history_state["market_mode"])
+        vol_ratio = indicators["atr"] / indicators["price"] if indicators["price"] else 0
+        market_mode = self.module_market.run(
+            score,
+            self._history_state["market_mode"],
+            volatility_ratio=vol_ratio,
+        )
         w_bb, w_atr, w_trend = self.module_weights.run(market_mode)
         long_step, short_step = self.module_step.run(
             (w_bb, w_atr, w_trend),
             direction,
             strength,
+            indicators,
         )
 
         self._history_state = {
