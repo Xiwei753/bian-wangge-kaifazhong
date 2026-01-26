@@ -4,9 +4,28 @@
 # 这是一个逻辑演示文件，用于展示策略"大脑"是如何思考的。
 # ==============================================================================
 
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
 from peizhi import GridConfig, MarketMode
+from zhibiaojisuan import TechnicalIndicators
 
 config = GridConfig()
+
+
+@dataclass
+class StrategyDecision:
+    """打包策略输出，供主程序读取"""
+    direction: str
+    strength: float
+    confidence: float
+    duration: int
+    score: float
+    market_mode: MarketMode
+    weights: Dict[str, float]
+    long_step: float
+    short_step: float
+    indicators: Dict[str, float]
 
 
 # ==============================================================================
@@ -181,3 +200,77 @@ class Module5_StepCalculation:
             print(f"     -> 买单(逆): {long_step:.4%} (加宽x{expand:.2f})")
             
         return long_step, short_step
+
+
+class AdvancedTrendAnalyzer:
+    """主类：管理历史状态并串联各模块"""
+    def __init__(self, config_override: Optional[GridConfig] = None):
+        global config
+        if config_override is not None:
+            config = config_override
+        self.config = config
+        self.module_scoring = Module1_TrendScoring()
+        self.module_continuation = Module2_SignalContinuation()
+        self.module_market = Module3_MarketModeSwitch()
+        self.module_weights = Module4_DynamicWeights()
+        self.module_step = Module5_StepCalculation()
+        self._history_state = {
+            "last_direction": "SIDEWAYS",
+            "duration": 0,
+            "market_mode": MarketMode.CONSOLIDATION,
+        }
+
+    def _build_indicators(self, klines: List[Dict]) -> Dict[str, float]:
+        prices = [kline.get("close") for kline in klines]
+        ema_fast = TechnicalIndicators.ema(prices, period=12)
+        ema_slow = TechnicalIndicators.ema(prices, period=26)
+        rsi = TechnicalIndicators.rsi(prices, period=14)
+        momentum = TechnicalIndicators.momentum(prices, short_period=5, medium_period=10)
+        bb = TechnicalIndicators.bollinger_bands(prices, period=20, std_dev=2)
+        price = TechnicalIndicators._to_float(prices[-1]) if prices else 0.0
+
+        return {
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "rsi": rsi,
+            "momentum": momentum["short"],
+            "price": price,
+            "bb_upper": bb["upper"],
+        }
+
+    def analyze(self, klines: List[Dict]) -> StrategyDecision:
+        indicators = self._build_indicators(klines)
+        direction, raw_strength, score = self.module_scoring.run(indicators)
+
+        strength, confidence, duration = self.module_continuation.run(
+            direction,
+            raw_strength,
+            self._history_state,
+        )
+
+        market_mode = self.module_market.run(score, self._history_state["market_mode"])
+        w_bb, w_atr, w_trend = self.module_weights.run(market_mode)
+        long_step, short_step = self.module_step.run(
+            (w_bb, w_atr, w_trend),
+            direction,
+            strength,
+        )
+
+        self._history_state = {
+            "last_direction": direction,
+            "duration": duration,
+            "market_mode": market_mode,
+        }
+
+        return StrategyDecision(
+            direction=direction,
+            strength=strength,
+            confidence=confidence,
+            duration=duration,
+            score=score,
+            market_mode=market_mode,
+            weights={"bb": w_bb, "atr": w_atr, "trend": w_trend},
+            long_step=long_step,
+            short_step=short_step,
+            indicators=indicators,
+        )
