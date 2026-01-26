@@ -18,6 +18,7 @@ import time
 from peizhi import GridConfig
 from qushifenxi import AdvancedTrendAnalyzer, StrategyDecision
 from zhiyingguanli import LifecycleManager
+from zhiyingtiaozheng import TrendTakeProfitAdjuster
 from zhibiaojisuan import TechnicalIndicators
 
 
@@ -101,6 +102,12 @@ class GridEngine:
         self._indicator_lock = threading.Lock()
         self.latest_indicators: Dict[str, float] = {}
         self.trend_analyzer = AdvancedTrendAnalyzer(config)
+        self.tp_adjuster = TrendTakeProfitAdjuster(
+            client=self.client,
+            config=self.config,
+            lifecycle_manager=self.lifecycle_manager,
+            logger=self.logger,
+        )
         self._decision_lock = threading.Lock()
         self.current_decision: Optional[StrategyDecision] = None
 
@@ -687,6 +694,26 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
                 decision.score,
                 decision.strength,
             )
+        try:
+            current_price = indicators["price"] if indicators else float(normalized["close"])
+            active_decision = decision or engine._get_current_decision()
+            long_step_ratio = (
+                active_decision.long_step
+                if active_decision
+                else engine.config.long_open_short_tp_step_ratio
+            )
+            short_step_ratio = (
+                active_decision.short_step
+                if active_decision
+                else engine.config.short_open_long_tp_step_ratio
+            )
+            engine.tp_adjuster.adjust_take_profit_for_trend(
+                current_price=current_price,
+                long_step_ratio=long_step_ratio,
+                short_step_ratio=short_step_ratio,
+            )
+        except Exception as exc:
+            logger.exception("WS止盈调整异常: %s", exc)
         if normalized["is_closed"]:
             logger.info("K线收盘 open_time=%s close=%s", normalized["open_time"], normalized["close"])
 

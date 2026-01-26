@@ -45,34 +45,55 @@ class TrendTakeProfitAdjuster:
             self.logger.debug("非趋势市，跳过止盈调整")
             return []
 
-        grid_records = self._collect_grid_records(current_price)
-        tp_records = self._index_tp_records()
         results: List[TpAdjustmentResult] = []
+        try:
+            self.lifecycle_manager.reload_from_disk()
+            grid_records = self._collect_grid_records(current_price)
+            tp_records = self._index_tp_records()
+        except Exception as exc:
+            self.logger.exception("加载本地止盈记录失败: %s", exc)
+            return results
 
         for grid_record in grid_records:
-            tp_record = tp_records.get(grid_record.order_id)
-            if tp_record is None:
-                continue
-            target_price = self._calculate_tp_price(
-                entry_price=grid_record.price,
-                entry_side=grid_record.entry_side,
-                long_step_ratio=long_step_ratio,
-                short_step_ratio=short_step_ratio,
-            )
-            if not self._should_move_tp(tp_record.price, target_price, current_price):
+            tp_record: Optional[LifecycleRecord] = None
+            try:
+                tp_record = tp_records.get(grid_record.order_id)
+                if tp_record is None:
+                    continue
+                target_price = self._calculate_tp_price(
+                    entry_price=grid_record.price,
+                    entry_side=grid_record.entry_side,
+                    long_step_ratio=long_step_ratio,
+                    short_step_ratio=short_step_ratio,
+                )
+                if not self._should_move_tp(tp_record.price, target_price, current_price):
+                    results.append(
+                        TpAdjustmentResult(
+                            parent_order_id=grid_record.order_id,
+                            old_tp_order_id=tp_record.order_id,
+                            new_tp_order_id=None,
+                            old_tp_price=tp_record.price,
+                            new_tp_price=target_price,
+                            skipped_reason="移动幅度不足0.1%",
+                        )
+                    )
+                    continue
+                result = self._replace_tp_order(grid_record, tp_record, target_price)
+                results.append(result)
+            except Exception as exc:
+                self.logger.exception(
+                    "止盈调整异常 parent_id=%s error=%s", grid_record.order_id, exc
+                )
                 results.append(
                     TpAdjustmentResult(
                         parent_order_id=grid_record.order_id,
-                        old_tp_order_id=tp_record.order_id,
+                        old_tp_order_id=tp_record.order_id if tp_record else 0,
                         new_tp_order_id=None,
-                        old_tp_price=tp_record.price,
-                        new_tp_price=target_price,
-                        skipped_reason="移动幅度不足0.1%",
+                        old_tp_price=tp_record.price if tp_record else 0.0,
+                        new_tp_price=grid_record.price,
+                        skipped_reason="止盈调整异常",
                     )
                 )
-                continue
-            result = self._replace_tp_order(grid_record, tp_record, target_price)
-            results.append(result)
 
         return results
 
