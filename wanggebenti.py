@@ -15,7 +15,7 @@ import random
 import threading
 import time
 
-from peizhi import GridConfig
+from peizhi import GridConfig, MarketMode
 from qushifenxi import AdvancedTrendAnalyzer, StrategyDecision
 from zhiyingguanli import LifecycleManager
 from zhiyingtiaozheng import TrendTakeProfitAdjuster
@@ -403,6 +403,23 @@ class GridEngine:
             self.state.sell_order_id = None
             self.state.sell_client_order_id = None
 
+    def handle_trend_entry(self, center_price: float) -> None:
+        task = TradeTask(
+            order_id=int(time.time() * 1000),
+            side="TREND_SWITCH",
+            price=center_price,
+            quantity=0,
+            task_type="trend_switch",
+        )
+        self.logger.info("进入趋势市，撤单并重新挂单 center=%.4f", center_price)
+        self._cancel_opposite(self.state.buy_order_id, self.state.buy_client_order_id, task)
+        self._cancel_opposite(self.state.sell_order_id, self.state.sell_client_order_id, task)
+        self.state.buy_order_id = None
+        self.state.buy_client_order_id = None
+        self.state.sell_order_id = None
+        self.state.sell_client_order_id = None
+        self._place_opening_orders(center_price, task)
+
     def _place_take_profit(
         self,
         side: str,
@@ -451,6 +468,7 @@ class GridEngine:
         self.lifecycle_manager.add_tp(
             order_id=order_id,
             price=tp_price,
+            quantity=order_size,
             parent_id=record_parent_id,
             entry_side=side,
             tp_side=tp_side,
@@ -686,16 +704,25 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
                 indicators["ema_slow"],
                 indicators["atr"],
             )
+        current_price = indicators["price"] if indicators else float(normalized["close"])
+        previous_decision = engine._get_current_decision()
         decision = engine.analyze_market()
         if decision:
-            logger.debug(
-                "市场分析更新 mode=%s score=%.2f strength=%.2f",
-                decision.market_mode.value,
-                decision.score,
-                decision.strength,
+            market_switched = (
+                previous_decision is not None
+                and previous_decision.market_mode != decision.market_mode
             )
+            if market_switched:
+                logger.info(
+                    "市场切换 %s -> %s score=%.2f strength=%.2f",
+                    previous_decision.market_mode.value,
+                    decision.market_mode.value,
+                    decision.score,
+                    decision.strength,
+                )
+            if market_switched and decision.market_mode == MarketMode.TREND:
+                engine.handle_trend_entry(current_price)
         try:
-            current_price = indicators["price"] if indicators else float(normalized["close"])
             active_decision = decision or engine._get_current_decision()
             long_step_ratio = (
                 active_decision.long_step
