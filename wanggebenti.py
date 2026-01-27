@@ -17,6 +17,7 @@ import time
 
 from peizhi import GridConfig, MarketMode
 from qushifenxi import AdvancedTrendAnalyzer, StrategyDecision
+from tuisong import push_wechat
 from zhiyingguanli import LifecycleManager
 from zhiyingtiaozheng import TrendTakeProfitAdjuster
 from zhibiaojisuan import TechnicalIndicators
@@ -119,6 +120,15 @@ class GridEngine:
         with self._decision_lock:
             self.current_decision = decision
         self.config.market_mode = decision.market_mode
+
+    def _push_message(self, message: str) -> None:
+        if not self.config.enable_wechat_push:
+            return
+        if not self.config.wechat_webhook_url:
+            return
+        ok = push_wechat(message, self.config.wechat_webhook_url)
+        if not ok:
+            self.logger.warning("企业微信推送失败: %s", message)
 
     def _get_current_decision(self) -> Optional[StrategyDecision]:
         with self._decision_lock:
@@ -412,6 +422,25 @@ class GridEngine:
             task_type="trend_switch",
         )
         self.logger.info("进入趋势市，撤单并重新挂单 center=%.4f", center_price)
+        self._push_message("市场切换: 进入趋势市 center={:.4f}".format(center_price))
+        self._cancel_opposite(self.state.buy_order_id, self.state.buy_client_order_id, task)
+        self._cancel_opposite(self.state.sell_order_id, self.state.sell_client_order_id, task)
+        self.state.buy_order_id = None
+        self.state.buy_client_order_id = None
+        self.state.sell_order_id = None
+        self.state.sell_client_order_id = None
+        self._place_opening_orders(center_price, task)
+
+    def handle_consolidation_entry(self, center_price: float) -> None:
+        task = TradeTask(
+            order_id=int(time.time() * 1000),
+            side="CONSOLIDATION_SWITCH",
+            price=center_price,
+            quantity=0,
+            task_type="consolidation_switch",
+        )
+        self.logger.info("进入震荡市，撤单并重新挂单 center=%.4f", center_price)
+        self._push_message("市场切换: 进入震荡市 center={:.4f}".format(center_price))
         self._cancel_opposite(self.state.buy_order_id, self.state.buy_client_order_id, task)
         self._cancel_opposite(self.state.sell_order_id, self.state.sell_client_order_id, task)
         self.state.buy_order_id = None
@@ -560,6 +589,19 @@ class GridEngine:
         else:
             self._cancel_opposite(opposite_order_id, opposite_client_order_id, task)
         self._place_opening_orders(task.price, task)
+        buy_step, sell_step = self._decide_grid_steps(task.price)
+        next_buy_price = self._round_price(task.price - buy_step) if buy_step else None
+        next_sell_price = self._round_price(task.price + sell_step) if sell_step else None
+        self._push_message(
+            "开仓成交 side={side} price={price:.4f} qty={qty:.4f} "
+            "next_buy={next_buy} next_sell={next_sell}".format(
+                side=task.side,
+                price=task.price,
+                qty=task.quantity,
+                next_buy=next_buy_price if next_buy_price is not None else "-",
+                next_sell=next_sell_price if next_sell_price is not None else "-",
+            )
+        )
 
         self.state.tp_order_id[task.side] = self._place_take_profit(
             side=task.side, entry_price=task.price, quantity=task.quantity, task=task
@@ -722,6 +764,8 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
                 )
             if market_switched and decision.market_mode == MarketMode.TREND:
                 engine.handle_trend_entry(current_price)
+            elif market_switched and decision.market_mode == MarketMode.CONSOLIDATION:
+                engine.handle_consolidation_entry(current_price)
         try:
             active_decision = decision or engine._get_current_decision()
             long_step_ratio = (
@@ -804,6 +848,13 @@ def _handle_user_data_message(
             if status == "FILLED":
                 tp_record = engine.lifecycle_manager.get_record(order_id)
                 parent_id = tp_record.parent_id if tp_record else None
+                engine._push_message(
+                    "止盈成交 side={side} price={price:.4f} qty={qty:.4f}".format(
+                        side=str(order.get("S")),
+                        price=avg_price,
+                        qty=last_qty,
+                    )
+                )
                 engine.lifecycle_manager.remove_record(order_id)
                 if parent_id:
                     engine.lifecycle_manager.remove_record(parent_id)
