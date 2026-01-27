@@ -279,6 +279,8 @@ class GridEngine:
         decision = self._get_current_decision()
         if decision is None:
             return default_buy_step, default_sell_step
+        if decision.market_mode == MarketMode.CONSOLIDATION:
+            return default_buy_step, default_sell_step
 
         buy_step = center_price * decision.long_step
         sell_step = center_price * decision.short_step
@@ -768,16 +770,12 @@ def _run_kline_ws(engine: GridEngine, stop_event: threading.Event) -> None:
                 engine.handle_consolidation_entry(current_price)
         try:
             active_decision = decision or engine._get_current_decision()
-            long_step_ratio = (
-                active_decision.long_step
-                if active_decision
-                else engine.config.long_open_short_tp_step_ratio
-            )
-            short_step_ratio = (
-                active_decision.short_step
-                if active_decision
-                else engine.config.short_open_long_tp_step_ratio
-            )
+            if active_decision and active_decision.market_mode == MarketMode.TREND:
+                long_step_ratio = active_decision.long_step
+                short_step_ratio = active_decision.short_step
+            else:
+                long_step_ratio = engine.config.long_open_short_tp_step_ratio
+                short_step_ratio = engine.config.short_open_long_tp_step_ratio
             engine.tp_adjuster.adjust_take_profit_for_trend(
                 current_price=current_price,
                 long_step_ratio=long_step_ratio,

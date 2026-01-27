@@ -46,9 +46,10 @@ class TrendTakeProfitAdjuster:
             self.lifecycle_manager.reload_from_disk()
             self._suspend_tp_if_exceeds_limit(current_price)
             self._resume_suspended_tp(current_price)
-            if self.config.market_mode != MarketMode.TREND:
-                self.logger.debug("非趋势市，跳过止盈调整")
-                return results
+            if self.config.market_mode == MarketMode.CONSOLIDATION:
+                long_step_ratio = self.config.long_open_short_tp_step_ratio
+                short_step_ratio = self.config.short_open_long_tp_step_ratio
+                self.logger.debug("震荡市止盈调整，使用固定步长")
             grid_records = self._collect_grid_records(current_price)
             tp_records = self._index_tp_records()
         except Exception as exc:
