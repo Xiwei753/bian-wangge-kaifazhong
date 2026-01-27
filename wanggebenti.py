@@ -992,6 +992,15 @@ def _trade_worker(engine: GridEngine, stop_event: threading.Event) -> None:
 def run_grid_loop() -> None:
     config = GridConfig()
     engine = GridEngine(config)
+    engine._push_message(
+        "网格策略启动: symbol={symbol} timeframe={timeframe}m "
+        "长仓步长={long_step:.4f} 空仓步长={short_step:.4f}".format(
+            symbol=config.symbol,
+            timeframe=config.timeframe_minutes,
+            long_step=config.long_open_short_tp_step_ratio,
+            short_step=config.short_open_long_tp_step_ratio,
+        )
+    )
     _load_initial_klines(engine)
     engine.analyze_initial_trend()
     engine.initialize()
