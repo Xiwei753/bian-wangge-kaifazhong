@@ -20,9 +20,9 @@ class GridConfig:
         self.initial_capital: float = 10000
         self.leverage: int = 10
         self.margin_mode: str = "CROSSED"
-        self.grid_step_ratio: float = 0.001
-        self.long_open_short_tp_step_ratio: float = 0.001
-        self.short_open_long_tp_step_ratio: float = 0.001
+        self.grid_step_ratio: float = 0.002
+        self.long_open_short_tp_step_ratio: float = 0.002
+        self.short_open_long_tp_step_ratio: float = 0.002
         self.market_mode: MarketMode = MarketMode.CONSOLIDATION
 
         # ===================== 趋势评分配置 =====================
@@ -48,6 +48,9 @@ class GridConfig:
         
         # ===================== 功能开关配置 =====================
         self.enable_wechat_push: bool = True
+        self.wechat_webhook_url: str = (
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=43874765-eb79-481d-84ce-3773b1e879d7"
+        )
         self.enable_short: bool = True
         self.enable_flexible_tp: bool = True
         self.enable_profit_stop_for_trapped: bool = True
