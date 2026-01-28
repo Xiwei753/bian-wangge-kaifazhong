@@ -155,6 +155,124 @@ class GridEngine:
             finally:
                 self._push_queue.task_done()
 
+    def _format_push_message(
+        self,
+        title: str,
+        core_lines: List[str],
+        detail_lines: List[str],
+    ) -> str:
+        return "\n".join(
+            [title, "", "核心数据：", *core_lines, "", "交易详情：", *detail_lines]
+        )
+
+    def _get_base_asset(self) -> str:
+        symbol = self.config.symbol
+        for quote in ("USDC", "USDT"):
+            if symbol.endswith(quote):
+                return symbol[: -len(quote)]
+        return symbol
+
+    def _fetch_position_snapshot(self) -> Dict[str, Dict[str, float]]:
+        result = sdk.get_position_risk(self.client, symbol=self.config.symbol)
+        if not result or not result.get("ok"):
+            self.logger.warning("获取持仓信息失败: %s", result)
+            return {}
+        data = result.get("data") or []
+        if isinstance(data, dict):
+            data = [data]
+        snapshot: Dict[str, Dict[str, float]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            position_side = item.get("positionSide")
+            amount = float(item.get("positionAmt") or 0)
+            entry_price = float(item.get("entryPrice") or 0)
+            unrealized = float(item.get("unRealizedProfit") or item.get("unrealizedProfit") or 0)
+            if not position_side:
+                position_side = "LONG" if amount >= 0 else "SHORT"
+            snapshot[position_side] = {
+                "amount": amount,
+                "entry_price": entry_price,
+                "unrealized": unrealized,
+            }
+        return snapshot
+
+    def _format_position_summary(self, snapshot: Dict[str, Dict[str, float]]) -> str:
+        def _format_side(label: str, info: Optional[Dict[str, float]]) -> str:
+            if not info:
+                return f"{label} 空仓"
+            qty = abs(info.get("amount", 0.0))
+            if qty == 0:
+                return f"{label} 空仓"
+            return (
+                f"{label} {qty:.4f} @ {info.get('entry_price', 0.0):.4f} "
+                f"(浮盈{info.get('unrealized', 0.0):.2f})"
+            )
+
+        long_info = snapshot.get("LONG")
+        short_info = snapshot.get("SHORT")
+        return f"当前持仓：{_format_side('多', long_info)}；{_format_side('空', short_info)}"
+
+    def _build_market_reason(self, decision: Optional[StrategyDecision]) -> str:
+        if decision is None:
+            return "指标不足，暂用默认参数。"
+        indicators = decision.indicators or {}
+        ema_fast = indicators.get("ema_fast", 0)
+        ema_slow = indicators.get("ema_slow", 0)
+        rsi = indicators.get("rsi", 0)
+        momentum = indicators.get("momentum", 0)
+        price = indicators.get("price", 0)
+        bb_upper = indicators.get("bb_upper", 0)
+        atr = indicators.get("atr", 0)
+        ema_reason = "EMA金叉" if ema_fast > ema_slow else "EMA死叉"
+        if rsi >= 60:
+            rsi_reason = "RSI偏强"
+        elif rsi <= 40:
+            rsi_reason = "RSI偏弱"
+        else:
+            rsi_reason = "RSI中性"
+        momentum_reason = "动量向上" if momentum > 0.5 else "动量走弱"
+        if bb_upper and price and price > bb_upper:
+            bb_reason = "突破布林上轨"
+        else:
+            bb_reason = "未突破布林上轨"
+        vol_ratio = atr / price if price else 0
+        return (
+            f"{ema_reason}，{rsi_reason}，{momentum_reason}，{bb_reason}，"
+            f"ATR/价格={vol_ratio:.2%}，评分{decision.score:.2f}，"
+            f"强度{decision.strength:.2f}，置信{decision.confidence:.2f}，"
+            f"持续{decision.duration}周期"
+        )
+
+    def _build_step_summary(
+        self,
+        center_price: float,
+        decision: Optional[StrategyDecision],
+    ) -> str:
+        if decision and decision.market_mode == MarketMode.TREND:
+            buy_ratio = decision.long_step
+            sell_ratio = decision.short_step
+            if decision.direction == "UPTREND":
+                buy_label = "顺势买单"
+                sell_label = "逆势卖单"
+            elif decision.direction == "DOWNTREND":
+                buy_label = "逆势买单"
+                sell_label = "顺势卖单"
+            else:
+                buy_label = "买单"
+                sell_label = "卖单"
+        else:
+            buy_ratio = self.config.long_open_short_tp_step_ratio
+            sell_ratio = self.config.short_open_long_tp_step_ratio
+            buy_label = "买单"
+            sell_label = "卖单"
+        buy_step = self._round_price(center_price * buy_ratio)
+        sell_step = self._round_price(center_price * sell_ratio)
+        return (
+            f"{buy_label}步长 {buy_ratio:.2%} (≈{buy_step:.4f})，"
+            f"{sell_label}步长 {sell_ratio:.2%} (≈{sell_step:.4f})"
+        )
+
     def _get_current_decision(self) -> Optional[StrategyDecision]:
         with self._decision_lock:
             return self.current_decision
@@ -422,10 +540,18 @@ class GridEngine:
                     self._round_price(buy_price),
                     order_size,
                 )
+                base_asset = self._get_base_asset()
                 self._push_message(
-                    "挂买单 side=BUY price={price:.4f} qty={qty:.4f}".format(
-                        price=self._round_price(buy_price),
-                        qty=order_size,
+                    self._format_push_message(
+                        title=f"🧲 【挂单已提交】{self.config.symbol} 买单",
+                        core_lines=[
+                            f"挂单价格：{self._round_price(buy_price):.4f} U",
+                            f"挂单数量：{order_size:.4f} {base_asset}",
+                        ],
+                        detail_lines=[
+                            f"网格中心：{self._round_price(center_price):.4f} U",
+                            f"当前模式：{self.config.market_mode.value}",
+                        ],
                     )
                 )
             else:
@@ -465,10 +591,18 @@ class GridEngine:
                     self._round_price(sell_price),
                     order_size,
                 )
+                base_asset = self._get_base_asset()
                 self._push_message(
-                    "挂卖单 side=SELL price={price:.4f} qty={qty:.4f}".format(
-                        price=self._round_price(sell_price),
-                        qty=order_size,
+                    self._format_push_message(
+                        title=f"🧲 【挂单已提交】{self.config.symbol} 卖单",
+                        core_lines=[
+                            f"挂单价格：{self._round_price(sell_price):.4f} U",
+                            f"挂单数量：{order_size:.4f} {base_asset}",
+                        ],
+                        detail_lines=[
+                            f"网格中心：{self._round_price(center_price):.4f} U",
+                            f"当前模式：{self.config.market_mode.value}",
+                        ],
                     )
                 )
             else:
@@ -486,7 +620,21 @@ class GridEngine:
             task_type="trend_switch",
         )
         self.logger.info("进入趋势市，撤单并重新挂单 center=%.4f", center_price)
-        self._push_message("市场切换: 进入趋势市 center={:.4f}".format(center_price))
+        decision = self._get_current_decision()
+        reason = self._build_market_reason(decision)
+        step_summary = self._build_step_summary(center_price, decision)
+        self._push_message(
+            self._format_push_message(
+                title=f"📈 【市场切换】{self.config.symbol} 进入趋势市",
+                core_lines=[
+                    f"中心价格：{self._round_price(center_price):.4f} U",
+                    f"步长调整：{step_summary}",
+                ],
+                detail_lines=[
+                    f"趋势理由：{reason}",
+                ],
+            )
+        )
         self._cancel_opposite(self.state.buy_order_id, self.state.buy_client_order_id, task)
         self._cancel_opposite(self.state.sell_order_id, self.state.sell_client_order_id, task)
         self.state.buy_order_id = None
@@ -504,7 +652,21 @@ class GridEngine:
             task_type="consolidation_switch",
         )
         self.logger.info("进入震荡市，撤单并重新挂单 center=%.4f", center_price)
-        self._push_message("市场切换: 进入震荡市 center={:.4f}".format(center_price))
+        decision = self._get_current_decision()
+        reason = self._build_market_reason(decision)
+        step_summary = self._build_step_summary(center_price, decision)
+        self._push_message(
+            self._format_push_message(
+                title=f"📉 【市场切换】{self.config.symbol} 回到震荡市",
+                core_lines=[
+                    f"中心价格：{self._round_price(center_price):.4f} U",
+                    f"步长设置：{step_summary}",
+                ],
+                detail_lines=[
+                    f"震荡理由：{reason}",
+                ],
+            )
+        )
         self._cancel_opposite(self.state.buy_order_id, self.state.buy_client_order_id, task)
         self._cancel_opposite(self.state.sell_order_id, self.state.sell_client_order_id, task)
         self.state.buy_order_id = None
@@ -670,14 +832,32 @@ class GridEngine:
         buy_step, sell_step = self._decide_grid_steps(task.price)
         next_buy_price = self._round_price(task.price - buy_step) if buy_step else None
         next_sell_price = self._round_price(task.price + sell_step) if sell_step else None
+        position_snapshot = self._fetch_position_snapshot()
+        position_summary = self._format_position_summary(position_snapshot)
+        position_side = "LONG" if task.side == "BUY" else "SHORT"
+        current_position = position_snapshot.get(position_side)
+        avg_price = current_position.get("entry_price") if current_position else None
+        base_asset = self._get_base_asset()
         self._push_message(
-            "开仓成交 side={side} price={price:.4f} qty={qty:.4f} "
-            "next_buy={next_buy} next_sell={next_sell}".format(
-                side=task.side,
-                price=task.price,
-                qty=task.quantity,
-                next_buy=next_buy_price if next_buy_price is not None else "-",
-                next_sell=next_sell_price if next_sell_price is not None else "-",
+            self._format_push_message(
+                title=f"✅ 【开仓成交】{self.config.symbol} 网格进场",
+                core_lines=[
+                    "成交价格：{price:.4f} U ({side})".format(
+                        price=task.price,
+                        side="买入开多" if task.side == "BUY" else "卖出开空",
+                    ),
+                    f"成交数量：{task.quantity:.4f} {base_asset}",
+                    "当前持仓均价：{avg}".format(
+                        avg=f"{avg_price:.4f} U" if avg_price else "-",
+                    ),
+                ],
+                detail_lines=[
+                    position_summary,
+                    "下一网格：买 {next_buy} / 卖 {next_sell}".format(
+                        next_buy=f"{next_buy_price:.4f} U" if next_buy_price else "-",
+                        next_sell=f"{next_sell_price:.4f} U" if next_sell_price else "-",
+                    ),
+                ],
             )
         )
 
@@ -922,11 +1102,58 @@ def _handle_user_data_message(
             if status == "FILLED":
                 tp_record = engine.lifecycle_manager.get_record(order_id)
                 parent_id = tp_record.parent_id if tp_record else None
+                entry_record = (
+                    engine.lifecycle_manager.get_record(parent_id) if parent_id else None
+                )
+                entry_price = entry_record.price if entry_record else None
+                entry_side = tp_record.entry_side if tp_record else None
+                profit_amount = None
+                profit_ratio = None
+                base_asset = engine._get_base_asset()
+                if entry_price and total_qty:
+                    if entry_side == "BUY":
+                        profit_amount = (avg_price - entry_price) * total_qty
+                    elif entry_side == "SELL":
+                        profit_amount = (entry_price - avg_price) * total_qty
+                    if entry_price:
+                        profit_ratio = profit_amount / (entry_price * total_qty)
+                position_snapshot = engine._fetch_position_snapshot()
+                position_summary = engine._format_position_summary(position_snapshot)
+                position_side = "LONG" if entry_side == "BUY" else "SHORT"
+                position_info = position_snapshot.get(position_side, {})
+                after_qty = abs(position_info.get("amount", 0.0))
+                before_qty = after_qty + total_qty
                 engine._push_message(
-                    "止盈成交 side={side} price={price:.4f} qty={qty:.4f}".format(
-                        side=str(order.get("S")),
-                        price=avg_price,
-                        qty=total_qty,
+                    engine._format_push_message(
+                        title=f"💰 【止盈落袋】{engine.config.symbol} 网格获利",
+                        core_lines=[
+                            "成交价格：{price:.4f} U ({side})".format(
+                                price=avg_price,
+                                side="卖出平多" if entry_side == "BUY" else "买入平空",
+                            ),
+                            "本网收益：{profit} 🟢".format(
+                                profit=(
+                                    f"{profit_amount:+.4f} U (未含手续费)"
+                                    if profit_amount is not None
+                                    else "-"
+                                ),
+                            ),
+                            "收益率：{ratio}".format(
+                                ratio=f"{profit_ratio:+.2%}" if profit_ratio is not None else "-",
+                            ),
+                        ],
+                        detail_lines=[
+                            "对应买单：{price}".format(
+                                price=f"{entry_price:.4f} U" if entry_price else "-",
+                            ),
+                            f"成交数量：{total_qty:.4f} {base_asset}",
+                            "持仓释放：{before:.4f} ➔ {after:.4f} {asset}".format(
+                                before=before_qty,
+                                after=after_qty,
+                                asset=base_asset,
+                            ),
+                            position_summary,
+                        ],
                     )
                 )
                 engine.lifecycle_manager.remove_record(order_id)
@@ -1069,12 +1296,18 @@ def run_grid_loop() -> None:
     config = GridConfig()
     engine = GridEngine(config)
     engine._push_message(
-        "网格策略启动: symbol={symbol} timeframe={timeframe}m "
-        "长仓步长={long_step:.4f} 空仓步长={short_step:.4f}".format(
-            symbol=config.symbol,
-            timeframe=config.timeframe_minutes,
-            long_step=config.long_open_short_tp_step_ratio,
-            short_step=config.short_open_long_tp_step_ratio,
+        engine._format_push_message(
+            title=f"🚀 【策略启动】{config.symbol} 网格已上线",
+            core_lines=[
+                f"交易对：{config.symbol}",
+                f"K线周期：{config.timeframe_minutes}m",
+            ],
+            detail_lines=[
+                "基础步长：买单 {long_step:.2%} / 卖单 {short_step:.2%}".format(
+                    long_step=config.long_open_short_tp_step_ratio,
+                    short_step=config.short_open_long_tp_step_ratio,
+                ),
+            ],
         )
     )
     _load_initial_klines(engine)
