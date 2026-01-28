@@ -10,11 +10,13 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import importlib.util
+import importlib
 import queue
 import random
 import threading
 import time
 
+import peizhi as peizhi_module
 from peizhi import GridConfig, MarketMode
 from qushifenxi import AdvancedTrendAnalyzer, StrategyDecision
 from tuisong import push_wechat
@@ -251,10 +253,19 @@ class GridEngine:
         return None
 
     def _round_price(self, value: float) -> float:
-        return round(value, 1)
+        return round(value, self.config.price_precision)
 
     def _round_quantity(self, value: float) -> float:
-        return round(value, 2)
+        return round(value, self.config.qty_precision)
+
+    def _get_latest_order_size(self) -> float:
+        try:
+            importlib.reload(peizhi_module)
+            latest_config = peizhi_module.GridConfig()
+            self.config.fixed_order_size = latest_config.fixed_order_size
+        except Exception as exc:
+            self.logger.warning("读取最新下单数量失败: %s", exc)
+        return self._round_quantity(self.config.fixed_order_size)
 
     def _get_current_price(self) -> float:
         result = sdk.get_ticker_price(self.client, self.config.symbol)
@@ -290,7 +301,7 @@ class GridEngine:
         self, center_price: float, side: str, task: "TradeTask"
     ) -> Optional[int]:
         step = center_price * self._get_open_step_ratio(side)
-        order_size = self._round_quantity(self.config.fixed_order_size)
+        order_size = self._get_latest_order_size()
         self.state.last_center_price = self._round_price(center_price)
         if side == "BUY":
             price = center_price - step
@@ -314,7 +325,11 @@ class GridEngine:
             if result and result.get("ok"):
                 self.state.buy_order_id = int(result["data"]["orderId"])
                 self.state.buy_client_order_id = client_order_id
-                self.logger.info("挂买单成功: 价格 %s", self._round_price(price))
+                self.logger.info(
+                    "挂买单成功: 价格 %s 数量 %s",
+                    self._round_price(price),
+                    order_size,
+                )
                 return self.state.buy_order_id
             self.logger.error("挂买单失败: %s", result)
             return None
@@ -339,14 +354,18 @@ class GridEngine:
         if result and result.get("ok"):
             self.state.sell_order_id = int(result["data"]["orderId"])
             self.state.sell_client_order_id = client_order_id
-            self.logger.info("挂卖单成功: 价格 %s", self._round_price(price))
+            self.logger.info(
+                "挂卖单成功: 价格 %s 数量 %s",
+                self._round_price(price),
+                order_size,
+            )
             return self.state.sell_order_id
         self.logger.error("挂卖单失败: %s", result)
         return None
 
     def _place_opening_orders(self, center_price: float, task: "TradeTask") -> None:
         buy_step, sell_step = self._decide_grid_steps(center_price)
-        order_size = self._round_quantity(self.config.fixed_order_size)
+        order_size = self._get_latest_order_size()
         self.state.last_center_price = self._round_price(center_price)
         
         if buy_step is not None:
@@ -375,7 +394,17 @@ class GridEngine:
                     entry_side="BUY",
                     status="NEW",
                 )
-                self.logger.info(f"挂买单成功: 价格 {self._round_price(buy_price)}")
+                self.logger.info(
+                    "挂买单成功: 价格 %s 数量 %s",
+                    self._round_price(buy_price),
+                    order_size,
+                )
+                self._push_message(
+                    "挂买单 side=BUY price={price:.4f} qty={qty:.4f}".format(
+                        price=self._round_price(buy_price),
+                        qty=order_size,
+                    )
+                )
             else:
                 self.logger.error(f"挂买单失败: {buy}")
         else:
@@ -408,7 +437,17 @@ class GridEngine:
                     entry_side="SELL",
                     status="NEW",
                 )
-                self.logger.info(f"挂卖单成功: 价格 {self._round_price(sell_price)}")
+                self.logger.info(
+                    "挂卖单成功: 价格 %s 数量 %s",
+                    self._round_price(sell_price),
+                    order_size,
+                )
+                self._push_message(
+                    "挂卖单 side=SELL price={price:.4f} qty={qty:.4f}".format(
+                        price=self._round_price(sell_price),
+                        qty=order_size,
+                    )
+                )
             else:
                 self.logger.error(f"挂卖单失败: {sell}")
         else:
@@ -520,6 +559,20 @@ class GridEngine:
             res = sdk.change_position_mode(self.client, dual_side=True)
             if not res['ok'] and res.get('status_code') != 400: 
                 self.logger.warning(f"设置持仓模式警告: {res}")
+            leverage_res = sdk.change_leverage(
+                self.client,
+                self.config.symbol,
+                self.config.leverage,
+            )
+            if leverage_res and not leverage_res.get("ok"):
+                self.logger.warning(f"设置杠杆警告: {leverage_res}")
+            margin_res = sdk.change_margin_type(
+                self.client,
+                self.config.symbol,
+                self.config.margin_mode,
+            )
+            if margin_res and not margin_res.get("ok"):
+                self.logger.warning(f"设置保证金模式警告: {margin_res}")
         except Exception as e:
             self.logger.warning(f"设置持仓模式异常 (如果是 'No need to change' 可忽略): {e}")
 
