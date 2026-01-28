@@ -69,7 +69,7 @@ class GridConfig:
         self.position_report_interval: int = 180  # 仓位报告间隔（秒）
         
         # ===================== 动态网格管理配置 =====================
-        self.consolidation_step_min_ratio: float = 0.0025  # 震荡市最小网格间距
+        self.consolidation_step_min_ratio: float = 0.001  # 震荡市最小网格间距
         self.consolidation_step_max_ratio: float = 0.006  # 震荡市最大网格间距
         self.trend_follow_step_min_ratio: float = 0.001  # 顺势最小网格间距
         self.trend_follow_step_max_ratio: float = 0.003  # 顺势最大网格间距
@@ -184,4 +184,5 @@ class GridConfig:
     def get_api_secret(self) -> str:
         """根据是否测试网返回对应 API Secret。"""
         return self.api_secret_test if self.use_testnet else self.api_secret_live
+
 
