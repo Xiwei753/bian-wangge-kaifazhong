@@ -24,7 +24,7 @@ class GridConfig:
         self.long_open_short_tp_step_ratio: float = 0.002  # 多开后空单止盈步长比例
         self.short_open_long_tp_step_ratio: float = 0.002  # 空开后多单止盈步长比例
         self.market_mode: MarketMode = MarketMode.CONSOLIDATION  # 市场模式：震荡(consolidation)或趋势(trend)
-        self.price_precision: int = 1  # 价格精度（小数位数），例如 1 表示 0.1
+        self.price_precision: int = 2  # 价格精度（小数位数），例如 1 表示 0.1
         self.qty_precision: int = 2  # 数量精度（小数位数），例如 2 表示 0.01
 
         # ===================== 趋势评分配置 =====================
@@ -184,3 +184,4 @@ class GridConfig:
     def get_api_secret(self) -> str:
         """根据是否测试网返回对应 API Secret。"""
         return self.api_secret_test if self.use_testnet else self.api_secret_live
+
