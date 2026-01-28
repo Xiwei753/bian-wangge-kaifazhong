@@ -113,6 +113,13 @@ class GridEngine:
         )
         self._decision_lock = threading.Lock()
         self.current_decision: Optional[StrategyDecision] = None
+        self._push_queue: "queue.Queue[str]" = queue.Queue()
+        self._push_thread = threading.Thread(
+            target=self._push_worker,
+            name="wechat_push_worker",
+            daemon=True,
+        )
+        self._push_thread.start()
 
     def update_indicators(self, indicators: Dict[str, float]) -> None:
         with self._indicator_lock:
@@ -128,9 +135,25 @@ class GridEngine:
             return
         if not self.config.wechat_webhook_url:
             return
-        ok = push_wechat(message, self.config.wechat_webhook_url)
-        if not ok:
-            self.logger.warning("企业微信推送失败: %s", message)
+        try:
+            self._push_queue.put_nowait(message)
+        except Exception as exc:
+            self.logger.warning("推送消息入队失败: %s", exc)
+
+    def _push_worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                message = self._push_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                ok = push_wechat(message, self.config.wechat_webhook_url)
+                if not ok:
+                    self.logger.warning("企业微信推送失败: %s", message)
+            except Exception as exc:
+                self.logger.warning("企业微信推送异常: %s", exc)
+            finally:
+                self._push_queue.task_done()
 
     def _get_current_decision(self) -> Optional[StrategyDecision]:
         with self._decision_lock:
