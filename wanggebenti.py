@@ -902,19 +902,19 @@ def _handle_user_data_message(
     if event_type == "ORDER_TRADE_UPDATE":
         order = payload.get("o", {})
         exec_type = order.get("x")
-        last_qty = float(order.get("l") or 0)
+        total_qty = float(order.get("z") or 0)
         avg_price = float(order.get("ap") or 0)
         order_id = int(order.get("i") or 0)
         status = order.get("X")
         logger.info(
-            "订单更新 order_id=%s symbol=%s side=%s status=%s exec_type=%s avg_price=%s last_qty=%s",
+            "订单更新 order_id=%s symbol=%s side=%s status=%s exec_type=%s avg_price=%s total_qty=%s",
             order_id,
             order.get("s"),
             order.get("S"),
             status,
             exec_type,
             avg_price,
-            last_qty,
+            total_qty,
         )
         if order_id and engine.lifecycle_manager.has_tp_record(order_id):
             if status in ["CANCELED", "EXPIRED", "REJECTED"]:
@@ -926,20 +926,20 @@ def _handle_user_data_message(
                     "止盈成交 side={side} price={price:.4f} qty={qty:.4f}".format(
                         side=str(order.get("S")),
                         price=avg_price,
-                        qty=last_qty,
+                        qty=total_qty,
                     )
                 )
                 engine.lifecycle_manager.remove_record(order_id)
                 if parent_id:
                     engine.lifecycle_manager.remove_record(parent_id)
         is_opening_order = order_id in (engine.state.buy_order_id, engine.state.sell_order_id)
-        if exec_type == "TRADE" and last_qty > 0 and avg_price > 0:
+        if status == "FILLED" and total_qty > 0 and avg_price > 0:
             if is_opening_order:
                 engine.handle_ws_fill(
                     order_id=order_id,
                     side=str(order.get("S")),
                     price=avg_price,
-                    quantity=last_qty,
+                    quantity=total_qty,
                 )
     else:
         logger.debug("用户数据流事件=%s payload=%s", event_type, payload)
