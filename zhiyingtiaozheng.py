@@ -146,6 +146,43 @@ class TrendTakeProfitAdjuster:
             ),
         )
 
+    def _submit_batch_orders(self, orders: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        if not orders:
+            return []
+        self.logger.info("批量下单请求 count=%s", len(orders))
+        results: List[Dict[str, object]] = []
+        for offset in range(0, len(orders), 5):
+            batch = orders[offset : offset + 5]
+            result = sdk.new_batch_orders(self.client, orders=batch)
+            if not result or not result.get("ok"):
+                self.logger.warning("批量下单失败: %s", result)
+                continue
+            data = result.get("data") or []
+            if isinstance(data, dict):
+                data = [data]
+            if not data:
+                self.logger.warning("批量下单返回为空: %s", result)
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                code = item.get("code")
+                if code not in (None, 0):
+                    self.logger.warning("批量下单子订单异常: %s", item)
+            results.extend([item for item in data if isinstance(item, dict)])
+        return results
+
+    def _place_batch_tp_order(
+        self,
+        order: Dict[str, object],
+        client_order_id: str,
+    ) -> Optional[int]:
+        response_items = self._submit_batch_orders([order])
+        for item in response_items:
+            item_client_id = item.get("clientOrderId") or item.get("clientOrderID")
+            if item_client_id == client_order_id and item.get("orderId") is not None:
+                return int(item["orderId"])
+        return None
+
     def _resume_suspended_tp(self, current_price: float) -> None:
         if current_price <= 0:
             return
@@ -165,23 +202,24 @@ class TrendTakeProfitAdjuster:
                 continue
             tp_side, position_side = self._resolve_tp_side(record.entry_side)
             client_order_id = self._build_resume_client_order_id(record.parent_id or record.order_id)
-            new_order = sdk.new_order(
-                self.client,
-                symbol=self.config.symbol,
-                side=record.tp_side or tp_side,
-                order_type="LIMIT",
-                quantity=round(record.quantity, 2),
-                price=record.price,
-                time_in_force="GTC",
-                position_side=position_side,
+            new_order_id = self._place_batch_tp_order(
+                order={
+                    "symbol": self.config.symbol,
+                    "side": record.tp_side or tp_side,
+                    "type": "LIMIT",
+                    "quantity": round(record.quantity, 2),
+                    "price": record.price,
+                    "timeInForce": "GTC",
+                    "positionSide": position_side,
+                    "newClientOrderId": client_order_id,
+                },
                 client_order_id=client_order_id,
             )
-            if not new_order.get("ok"):
+            if new_order_id is None:
                 self.logger.warning(
-                    "恢复止盈单失败 order_id=%s result=%s", record.order_id, new_order
+                    "恢复止盈单失败 order_id=%s", record.order_id
                 )
                 continue
-            new_order_id = int(new_order["data"]["orderId"])
             self.lifecycle_manager.remove_record(record.order_id)
             self.lifecycle_manager.add_tp(
                 order_id=new_order_id,
@@ -294,19 +332,21 @@ class TrendTakeProfitAdjuster:
 
         tp_side, position_side = self._resolve_tp_side(grid_record.entry_side)
         client_order_id = self._build_client_order_id(grid_record.order_id)
-        new_order = sdk.new_order(
-            self.client,
-            symbol=self.config.symbol,
-            side=tp_side,
-            order_type="LIMIT",
-            quantity=round(quantity, 2),
-            price=target_price,
-            time_in_force="GTC",
-            position_side=position_side,
+        new_order_id = self._place_batch_tp_order(
+            order={
+                "symbol": self.config.symbol,
+                "side": tp_side,
+                "type": "LIMIT",
+                "quantity": round(quantity, 2),
+                "price": target_price,
+                "timeInForce": "GTC",
+                "positionSide": position_side,
+                "newClientOrderId": client_order_id,
+            },
             client_order_id=client_order_id,
         )
-        if not new_order.get("ok"):
-            self.logger.warning("新止盈单下单失败 parent_id=%s result=%s", grid_record.order_id, new_order)
+        if new_order_id is None:
+            self.logger.warning("新止盈单下单失败 parent_id=%s", grid_record.order_id)
             return TpAdjustmentResult(
                 parent_order_id=grid_record.order_id,
                 old_tp_order_id=tp_record.order_id,
@@ -315,8 +355,6 @@ class TrendTakeProfitAdjuster:
                 new_tp_price=target_price,
                 skipped_reason="新止盈单下单失败",
             )
-
-        new_order_id = int(new_order["data"]["orderId"])
         self.lifecycle_manager.remove_record(tp_record.order_id)
         self.lifecycle_manager.add_tp(
             order_id=new_order_id,

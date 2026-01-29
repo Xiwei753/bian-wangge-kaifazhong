@@ -6,6 +6,7 @@
 #需要一个实盘的地址，和api，一个测试的地址和api
 #都写到这里。peizhi里面就只写其他的参数
 
+import json
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -310,66 +311,9 @@ def change_position_mode(client: UMFutures, dual_side: bool) -> Dict[str, Any]:
 
 
 # ===================== 下单/撤单 =====================
-def new_order(
-    client: UMFutures,
-    symbol: str,
-    side: str,
-    order_type: str,
-    quantity: float,
-    price: Optional[float] = None,
-    time_in_force: Optional[str] = None,
-    reduce_only: Optional[bool] = None,
-    position_side: Optional[str] = None,
-    client_order_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "symbol": symbol,
-        "side": side,
-        "type": order_type,
-        "quantity": quantity,
-    }
-    if price is not None:
-        params["price"] = price
-    if time_in_force is not None:
-        params["timeInForce"] = time_in_force
-    if reduce_only is not None:
-        params["reduceOnly"] = reduce_only
-    if position_side is not None:
-        params["positionSide"] = position_side
-    if client_order_id is not None:
-        params["newClientOrderId"] = client_order_id
-    return _call(client.new_order, **params)
-
-
-def new_order_test(
-    client: UMFutures,
-    symbol: str,
-    side: str,
-    order_type: str,
-    quantity: float,
-    price: Optional[float] = None,
-    time_in_force: Optional[str] = None,
-    reduce_only: Optional[bool] = None,
-    position_side: Optional[str] = None,
-    client_order_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "symbol": symbol,
-        "side": side,
-        "type": order_type,
-        "quantity": quantity,
-    }
-    if price is not None:
-        params["price"] = price
-    if time_in_force is not None:
-        params["timeInForce"] = time_in_force
-    if reduce_only is not None:
-        params["reduceOnly"] = reduce_only
-    if position_side is not None:
-        params["positionSide"] = position_side
-    if client_order_id is not None:
-        params["newClientOrderId"] = client_order_id
-    return _call_method(client, "new_order_test", **params)
+def new_batch_orders(client: UMFutures, orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"batchOrders": json.dumps(orders, ensure_ascii=False)}
+    return _call_method(client, "new_batch_order", **params)
 
 
 def cancel_order(
