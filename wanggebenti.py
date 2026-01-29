@@ -451,6 +451,7 @@ class GridEngine:
     ) -> List[Dict[str, object]]:
         if not orders:
             return []
+        self.logger.info("批量下单请求 count=%s", len(orders))
         results: List[Dict[str, object]] = []
         for offset in range(0, len(orders), 5):
             batch = orders[offset : offset + 5]
@@ -470,6 +471,12 @@ class GridEngine:
                 data = [data]
             if not data:
                 self.logger.warning("批量下单返回为空: %s", result)
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                code = item.get("code")
+                if code not in (None, 0):
+                    self.logger.warning("批量下单子订单异常: %s", item)
             results.extend([item for item in data if isinstance(item, dict)])
         return results
 
@@ -523,6 +530,9 @@ class GridEngine:
                 }
             )
 
+        if not orders:
+            self.logger.warning("批量开仓订单为空，无法提交")
+            return
         response_items = self._submit_batch_orders(task, orders)
         response_map: Dict[str, Dict[str, object]] = {}
         for item in response_items:
@@ -549,6 +559,8 @@ class GridEngine:
                         asset=base_asset,
                     )
                 )
+        elif buy_client_order_id:
+            self.logger.warning("批量挂买单无回执 client_id=%s", buy_client_order_id)
 
         if sell_client_order_id and sell_client_order_id in response_map and sell_price is not None:
             sell_data = response_map[sell_client_order_id]
@@ -569,6 +581,8 @@ class GridEngine:
                         asset=base_asset,
                     )
                 )
+        elif sell_client_order_id:
+            self.logger.warning("批量挂卖单无回执 client_id=%s", sell_client_order_id)
 
         if core_lines:
             self._push_message(
@@ -735,6 +749,9 @@ class GridEngine:
         orders.append(tp_order)
         self.state.tp_client_order_id[task.side] = tp_client_order_id
 
+        if not orders:
+            self.logger.warning("批量开仓+止盈订单为空，无法提交")
+            return
         response_items = self._submit_batch_orders(task, orders)
         response_map: Dict[str, Dict[str, object]] = {}
         for item in response_items:
@@ -759,6 +776,8 @@ class GridEngine:
                     self._round_price(task.price - buy_step),
                     order_size,
                 )
+        elif buy_client_order_id:
+            self.logger.warning("批量挂买单无回执 client_id=%s", buy_client_order_id)
 
         if sell_client_order_id and sell_client_order_id in response_map:
             sell_data = response_map[sell_client_order_id]
@@ -777,6 +796,8 @@ class GridEngine:
                     self._round_price(task.price + sell_step),
                     order_size,
                 )
+        elif sell_client_order_id:
+            self.logger.warning("批量挂卖单无回执 client_id=%s", sell_client_order_id)
 
         tp_data = response_map.get(tp_client_order_id)
         if tp_data and tp_data.get("orderId") is not None:
@@ -797,6 +818,8 @@ class GridEngine:
                 tp_price,
                 tp_quantity,
             )
+        else:
+            self.logger.warning("批量止盈单无回执 client_id=%s", tp_client_order_id)
 
     def initialize(self) -> None:
         self.logger.info("正在初始化策略...")

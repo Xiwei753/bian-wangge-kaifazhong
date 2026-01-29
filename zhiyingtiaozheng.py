@@ -149,6 +149,7 @@ class TrendTakeProfitAdjuster:
     def _submit_batch_orders(self, orders: List[Dict[str, object]]) -> List[Dict[str, object]]:
         if not orders:
             return []
+        self.logger.info("批量下单请求 count=%s", len(orders))
         results: List[Dict[str, object]] = []
         for offset in range(0, len(orders), 5):
             batch = orders[offset : offset + 5]
@@ -161,6 +162,12 @@ class TrendTakeProfitAdjuster:
                 data = [data]
             if not data:
                 self.logger.warning("批量下单返回为空: %s", result)
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                code = item.get("code")
+                if code not in (None, 0):
+                    self.logger.warning("批量下单子订单异常: %s", item)
             results.extend([item for item in data if isinstance(item, dict)])
         return results
 
