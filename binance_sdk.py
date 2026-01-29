@@ -6,6 +6,7 @@
 #需要一个实盘的地址，和api，一个测试的地址和api
 #都写到这里。peizhi里面就只写其他的参数
 
+import json
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -311,7 +312,7 @@ def change_position_mode(client: UMFutures, dual_side: bool) -> Dict[str, Any]:
 
 # ===================== 下单/撤单 =====================
 def new_batch_orders(client: UMFutures, orders: List[Dict[str, Any]]) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"batchOrders": orders}
+    params: Dict[str, Any] = {"batchOrders": json.dumps(orders, ensure_ascii=False)}
     return _call_method(client, "new_batch_order", **params)
 
 

@@ -468,6 +468,8 @@ class GridEngine:
             data = result.get("data") or []
             if isinstance(data, dict):
                 data = [data]
+            if not data:
+                self.logger.warning("批量下单返回为空: %s", result)
             results.extend([item for item in data if isinstance(item, dict)])
         return results
 
