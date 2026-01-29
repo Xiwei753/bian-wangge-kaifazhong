@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -161,9 +162,14 @@ class GridEngine:
         core_lines: List[str],
         detail_lines: List[str],
     ) -> str:
+        timestamp = self._format_beijing_timestamp()
         return "\n".join(
-            [title, "", "核心数据：", *core_lines, "", "交易详情：", *detail_lines]
+            [title, f"时间：{timestamp}", "", "核心数据：", *core_lines, "", "交易详情：", *detail_lines]
         )
+
+    def _format_beijing_timestamp(self) -> str:
+        beijing_tz = timezone(timedelta(hours=8))
+        return datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
 
     def _get_base_asset(self) -> str:
         symbol = self.config.symbol
@@ -508,7 +514,9 @@ class GridEngine:
         buy_step, sell_step = self._decide_grid_steps(center_price)
         order_size = self._get_latest_order_size()
         self.state.last_center_price = self._round_price(center_price)
-        
+        base_asset = self._get_base_asset()
+        core_lines: List[str] = []
+
         if buy_step is not None:
             buy_price = center_price - buy_step
             buy_client_order_id = self._build_client_order_id(task, "ob")
@@ -540,18 +548,11 @@ class GridEngine:
                     self._round_price(buy_price),
                     order_size,
                 )
-                base_asset = self._get_base_asset()
-                self._push_message(
-                    self._format_push_message(
-                        title=f"🧲 【挂单已提交】{self.config.symbol} 买单",
-                        core_lines=[
-                            f"挂单价格：{self._round_price(buy_price):.4f} U",
-                            f"挂单数量：{order_size:.4f} {base_asset}",
-                        ],
-                        detail_lines=[
-                            f"网格中心：{self._round_price(center_price):.4f} U",
-                            f"当前模式：{self.config.market_mode.value}",
-                        ],
+                core_lines.append(
+                    "买单：价格 {price:.4f} U / 数量 {qty:.4f} {asset}".format(
+                        price=self._round_price(buy_price),
+                        qty=order_size,
+                        asset=base_asset,
                     )
                 )
             else:
@@ -591,18 +592,11 @@ class GridEngine:
                     self._round_price(sell_price),
                     order_size,
                 )
-                base_asset = self._get_base_asset()
-                self._push_message(
-                    self._format_push_message(
-                        title=f"🧲 【挂单已提交】{self.config.symbol} 卖单",
-                        core_lines=[
-                            f"挂单价格：{self._round_price(sell_price):.4f} U",
-                            f"挂单数量：{order_size:.4f} {base_asset}",
-                        ],
-                        detail_lines=[
-                            f"网格中心：{self._round_price(center_price):.4f} U",
-                            f"当前模式：{self.config.market_mode.value}",
-                        ],
+                core_lines.append(
+                    "卖单：价格 {price:.4f} U / 数量 {qty:.4f} {asset}".format(
+                        price=self._round_price(sell_price),
+                        qty=order_size,
+                        asset=base_asset,
                     )
                 )
             else:
@@ -610,6 +604,18 @@ class GridEngine:
         else:
             self.state.sell_order_id = None
             self.state.sell_client_order_id = None
+
+        if core_lines:
+            self._push_message(
+                self._format_push_message(
+                    title=f"🧲 【挂单已提交】{self.config.symbol} 多空开仓",
+                    core_lines=core_lines,
+                    detail_lines=[
+                        f"网格中心：{self._round_price(center_price):.4f} U",
+                        f"当前模式：{self.config.market_mode.value}",
+                    ],
+                )
+            )
 
     def handle_trend_entry(self, center_price: float) -> None:
         task = TradeTask(
