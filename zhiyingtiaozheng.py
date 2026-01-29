@@ -183,6 +183,12 @@ class TrendTakeProfitAdjuster:
                 return int(item["orderId"])
         return None
 
+    def _format_order_value(self, value: float) -> str:
+        return f"{value:.{self.config.price_precision}f}"
+
+    def _format_quantity_value(self, value: float) -> str:
+        return f"{value:.{self.config.qty_precision}f}"
+
     def _resume_suspended_tp(self, current_price: float) -> None:
         if current_price <= 0:
             return
@@ -207,8 +213,8 @@ class TrendTakeProfitAdjuster:
                     "symbol": self.config.symbol,
                     "side": record.tp_side or tp_side,
                     "type": "LIMIT",
-                    "quantity": round(record.quantity, 2),
-                    "price": record.price,
+                    "quantity": self._format_quantity_value(record.quantity),
+                    "price": self._format_order_value(record.price),
                     "timeInForce": "GTC",
                     "positionSide": position_side,
                     "newClientOrderId": client_order_id,
@@ -337,8 +343,8 @@ class TrendTakeProfitAdjuster:
                 "symbol": self.config.symbol,
                 "side": tp_side,
                 "type": "LIMIT",
-                "quantity": round(quantity, 2),
-                "price": target_price,
+                "quantity": self._format_quantity_value(quantity),
+                "price": self._format_order_value(target_price),
                 "timeInForce": "GTC",
                 "positionSide": position_side,
                 "newClientOrderId": client_order_id,

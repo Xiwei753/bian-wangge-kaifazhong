@@ -405,6 +405,12 @@ class GridEngine:
     def _round_quantity(self, value: float) -> float:
         return round(value, self.config.qty_precision)
 
+    def _format_order_value(self, value: float) -> str:
+        return f"{value:.{self.config.price_precision}f}"
+
+    def _format_quantity_value(self, value: float) -> str:
+        return f"{value:.{self.config.qty_precision}f}"
+
     def _get_latest_order_size(self) -> float:
         try:
             importlib.reload(peizhi_module)
@@ -506,8 +512,8 @@ class GridEngine:
                     "symbol": self.config.symbol,
                     "side": "BUY",
                     "type": "LIMIT",
-                    "quantity": order_size,
-                    "price": buy_price,
+                    "quantity": self._format_quantity_value(order_size),
+                    "price": self._format_order_value(buy_price),
                     "timeInForce": "GTC",
                     "positionSide": "LONG",
                     "newClientOrderId": buy_client_order_id,
@@ -522,8 +528,8 @@ class GridEngine:
                     "symbol": self.config.symbol,
                     "side": "SELL",
                     "type": "LIMIT",
-                    "quantity": order_size,
-                    "price": sell_price,
+                    "quantity": self._format_quantity_value(order_size),
+                    "price": self._format_order_value(sell_price),
                     "timeInForce": "GTC",
                     "positionSide": "SHORT",
                     "newClientOrderId": sell_client_order_id,
@@ -685,8 +691,8 @@ class GridEngine:
             "symbol": self.config.symbol,
             "side": tp_side,
             "type": "LIMIT",
-            "quantity": order_size,
-            "price": tp_price,
+            "quantity": self._format_quantity_value(order_size),
+            "price": self._format_order_value(tp_price),
             "timeInForce": "GTC",
             "positionSide": pos_side,
             "newClientOrderId": tp_client_order_id,
@@ -714,8 +720,8 @@ class GridEngine:
                     "symbol": self.config.symbol,
                     "side": "BUY",
                     "type": "LIMIT",
-                    "quantity": order_size,
-                    "price": buy_price,
+                    "quantity": self._format_quantity_value(order_size),
+                    "price": self._format_order_value(buy_price),
                     "timeInForce": "GTC",
                     "positionSide": "LONG",
                     "newClientOrderId": buy_client_order_id,
@@ -730,8 +736,8 @@ class GridEngine:
                     "symbol": self.config.symbol,
                     "side": "SELL",
                     "type": "LIMIT",
-                    "quantity": order_size,
-                    "price": sell_price,
+                    "quantity": self._format_quantity_value(order_size),
+                    "price": self._format_order_value(sell_price),
                     "timeInForce": "GTC",
                     "positionSide": "SHORT",
                     "newClientOrderId": sell_client_order_id,
