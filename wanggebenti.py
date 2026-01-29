@@ -738,6 +738,175 @@ class GridEngine:
         )
         return order_id
 
+    def _build_take_profit_order(
+        self,
+        side: str,
+        entry_price: float,
+        quantity: float,
+        task: "TradeTask",
+    ) -> Tuple[Dict[str, object], str, float, float, str]:
+        step = entry_price * self._get_take_profit_step_ratio(side)
+        if side == "BUY":
+            tp_price = entry_price + step
+            tp_side = "SELL"
+            pos_side = "LONG"
+            tp_action = "tpb"
+        else:
+            tp_price = entry_price - step
+            tp_side = "BUY"
+            pos_side = "SHORT"
+            tp_action = "tps"
+        order_size = self._round_quantity(quantity)
+        tp_price = self._round_price(tp_price)
+        tp_client_order_id = self._build_client_order_id(task, tp_action)
+        order = {
+            "symbol": self.config.symbol,
+            "side": tp_side,
+            "type": "LIMIT",
+            "quantity": order_size,
+            "price": tp_price,
+            "timeInForce": "GTC",
+            "positionSide": pos_side,
+            "newClientOrderId": tp_client_order_id,
+        }
+        return order, tp_client_order_id, tp_price, order_size, tp_side
+
+    def _place_opening_and_tp_batch(self, task: "TradeTask") -> None:
+        buy_step, sell_step = self._decide_grid_steps(task.price)
+        order_size = self._get_latest_order_size()
+        orders: List[Dict[str, object]] = []
+
+        self.state.last_center_price = self._round_price(task.price)
+        self.state.buy_order_id = None
+        self.state.buy_client_order_id = None
+        self.state.sell_order_id = None
+        self.state.sell_client_order_id = None
+
+        buy_client_order_id = None
+        sell_client_order_id = None
+        if buy_step is not None:
+            buy_price = self._round_price(task.price - buy_step)
+            buy_client_order_id = self._build_client_order_id(task, "ob")
+            orders.append(
+                {
+                    "symbol": self.config.symbol,
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "quantity": order_size,
+                    "price": buy_price,
+                    "timeInForce": "GTC",
+                    "positionSide": "LONG",
+                    "newClientOrderId": buy_client_order_id,
+                }
+            )
+
+        if sell_step is not None:
+            sell_price = self._round_price(task.price + sell_step)
+            sell_client_order_id = self._build_client_order_id(task, "os")
+            orders.append(
+                {
+                    "symbol": self.config.symbol,
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "quantity": order_size,
+                    "price": sell_price,
+                    "timeInForce": "GTC",
+                    "positionSide": "SHORT",
+                    "newClientOrderId": sell_client_order_id,
+                }
+            )
+
+        tp_order, tp_client_order_id, tp_price, tp_quantity, tp_side = (
+            self._build_take_profit_order(
+                side=task.side,
+                entry_price=task.price,
+                quantity=task.quantity,
+                task=task,
+            )
+        )
+        orders.append(tp_order)
+        self.state.tp_client_order_id[task.side] = tp_client_order_id
+
+        result = self._rest_call_with_retry(
+            task,
+            "new_batch_orders",
+            sdk.new_batch_orders,
+            allow_duplicate_check=False,
+            client=self.client,
+            orders=orders,
+        )
+        if not result or not result.get("ok"):
+            self.logger.error("批量下单失败: %s", result)
+            return
+
+        data = result.get("data") or []
+        if isinstance(data, dict):
+            data = [data]
+        response_map: Dict[str, Dict[str, object]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            client_id = item.get("clientOrderId") or item.get("clientOrderID")
+            if not client_id:
+                continue
+            response_map[str(client_id)] = item
+
+        if buy_client_order_id and buy_client_order_id in response_map:
+            buy_data = response_map[buy_client_order_id]
+            buy_order_id = buy_data.get("orderId")
+            if buy_order_id is not None:
+                self.state.buy_order_id = int(buy_order_id)
+                self.state.buy_client_order_id = buy_client_order_id
+                self.lifecycle_manager.add_grid(
+                    order_id=self.state.buy_order_id,
+                    price=self._round_price(task.price - buy_step),
+                    entry_side="BUY",
+                    status="NEW",
+                )
+                self.logger.info(
+                    "批量挂买单成功: 价格 %s 数量 %s",
+                    self._round_price(task.price - buy_step),
+                    order_size,
+                )
+
+        if sell_client_order_id and sell_client_order_id in response_map:
+            sell_data = response_map[sell_client_order_id]
+            sell_order_id = sell_data.get("orderId")
+            if sell_order_id is not None:
+                self.state.sell_order_id = int(sell_order_id)
+                self.state.sell_client_order_id = sell_client_order_id
+                self.lifecycle_manager.add_grid(
+                    order_id=self.state.sell_order_id,
+                    price=self._round_price(task.price + sell_step),
+                    entry_side="SELL",
+                    status="NEW",
+                )
+                self.logger.info(
+                    "批量挂卖单成功: 价格 %s 数量 %s",
+                    self._round_price(task.price + sell_step),
+                    order_size,
+                )
+
+        tp_data = response_map.get(tp_client_order_id)
+        if tp_data and tp_data.get("orderId") is not None:
+            tp_order_id = int(tp_data["orderId"])
+            self.state.tp_order_id[task.side] = tp_order_id
+            self.lifecycle_manager.add_tp(
+                order_id=tp_order_id,
+                price=tp_price,
+                quantity=tp_quantity,
+                parent_id=task.order_id,
+                entry_side=task.side,
+                tp_side=tp_side,
+            )
+            self.logger.info(
+                "批量止盈单已下达 entry_side=%s tp_side=%s tp_price=%.4f qty=%.2f",
+                task.side,
+                tp_side,
+                tp_price,
+                tp_quantity,
+            )
+
     def initialize(self) -> None:
         self.logger.info("正在初始化策略...")
         try:
@@ -828,7 +997,7 @@ class GridEngine:
             self._cancel_opposite(opposite_order_id, opposite_client_order_id, task)
         else:
             self._cancel_opposite(opposite_order_id, opposite_client_order_id, task)
-        self._place_opening_orders(task.price, task)
+        self._place_opening_and_tp_batch(task)
         buy_step, sell_step = self._decide_grid_steps(task.price)
         next_buy_price = self._round_price(task.price - buy_step) if buy_step else None
         next_sell_price = self._round_price(task.price + sell_step) if sell_step else None
@@ -859,10 +1028,6 @@ class GridEngine:
                     ),
                 ],
             )
-        )
-
-        self.state.tp_order_id[task.side] = self._place_take_profit(
-            side=task.side, entry_price=task.price, quantity=task.quantity, task=task
         )
 
 

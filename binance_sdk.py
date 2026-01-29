@@ -372,6 +372,11 @@ def new_order_test(
     return _call_method(client, "new_order_test", **params)
 
 
+def new_batch_orders(client: UMFutures, orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"batchOrders": orders}
+    return _call_method(client, "new_batch_order", **params)
+
+
 def cancel_order(
     client: UMFutures,
     symbol: str,
